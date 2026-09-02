@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -31,6 +31,30 @@ from app.plans import get_plan
 log = get_logger(__name__)
 
 
+# Fairness is done in the QUERY, per user. Widening a single global
+# "ORDER BY next_check_at LIMIT n" cannot work: an account with more due
+# monitors than the sample window fills it outright no matter how wide it is.
+MAX_USERS_PER_TICK = 200
+
+
+def _interleave_by_user(by_user: dict[int, list["Monitor"]]) -> list["Monitor"]:
+    """Round-robin across owners, oldest-due first within each owner, so one
+    account with a large backlog contributes one monitor per round instead of an
+    unbroken run at the head of the list."""
+    ordered: list[Monitor] = []
+    queues = list(by_user.values())
+    index = 0
+    while queues:
+        still_active = []
+        for queue in queues:
+            if index < len(queue):
+                ordered.append(queue[index])
+                still_active.append(queue)
+        queues = still_active
+        index += 1
+    return ordered
+
+
 def _period(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime("%Y-%m")
 
@@ -49,6 +73,27 @@ def record_usage(db: Session, user_id: int, *, checks: int = 0, changes: int = 0
     usage.checks_used += checks
     usage.changes_detected += changes
     return usage
+
+
+def _recent_empty_streak(db: Session, monitor_id: int) -> int:
+    """How many of the most recent checks in a row saw empty content.
+
+    Derived from the check history rather than a counter column so it needs no
+    schema migration; the project has no migration tooling yet (docs/DEPLOY.md).
+    """
+    recent = db.scalars(
+        select(Check)
+        .where(Check.monitor_id == monitor_id)
+        .order_by(Check.started_at.desc(), Check.id.desc())
+        .limit(10)
+    ).all()
+    streak = 0
+    for check in recent:
+        if check.error_type == "empty_content":
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def _schedule_next(monitor: Monitor, *, failed: bool) -> None:
@@ -129,6 +174,39 @@ def run_check(db: Session, monitor: Monitor, *, notify: bool = True) -> Check:
         log.info("check_error", monitor_id=monitor.id, error_type=error_kind, message=error_message)
         return check
 
+    # --- transient-blank guard --------------------------------------------
+    # An HTTP 200 with a body that extracts to nothing is far more often a site
+    # mid-deploy, an interstitial, or a soft error page than a real edit. Taking
+    # it at face value produces two false alerts per blip - one when the content
+    # "disappears" and another when it "comes back". Measured: two blips of a
+    # stable page produced four webhook notifications, none of them real.
+    #
+    # So an empty extraction that replaces non-empty content must be CONFIRMED by
+    # consecutive observations before it is believed. A page that genuinely
+    # empties still reports, just one interval later.
+    if not new_content and monitor.last_content:
+        confirmations = _recent_empty_streak(db, monitor.id) + 1
+        if confirmations < settings.empty_content_confirmations:
+            check.status = CheckStatus.error.value
+            check.error_type = "empty_content"
+            check.error_message = (
+                f"Extracted content was empty while the previous observation was not "
+                f"({confirmations}/{settings.empty_content_confirmations} confirmations). "
+                "Treating as a transient blank response, not a change."
+            )
+            monitor.consecutive_failures += 1
+            _schedule_next(monitor, failed=True)
+            db.add(check)
+            record_usage(db, monitor.user_id, checks=1)
+            db.flush()
+            log.info(
+                "empty_content_unconfirmed",
+                monitor_id=monitor.id, confirmations=confirmations,
+                required=settings.empty_content_confirmations,
+            )
+            return check
+        log.info("empty_content_confirmed", monitor_id=monitor.id, confirmations=confirmations)
+
     # --- success path -----------------------------------------------------
     monitor.consecutive_failures = 0
     new_hash = content_hash(new_content)
@@ -187,19 +265,65 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     times the compute cost per check.
     """
     now = datetime.now(timezone.utc)
-    candidates = db.scalars(
-        select(Monitor)
+
+    # Which accounts have work waiting. Cheap, and bounded per tick.
+    due_user_ids = db.scalars(
+        select(Monitor.user_id)
         .where(Monitor.is_active.is_(True))
         .where(Monitor.next_check_at <= now)
-        .order_by(Monitor.next_check_at)
-        .limit(limit)
+        .group_by(Monitor.user_id)
+        .order_by(func.min(Monitor.next_check_at))
+        .limit(MAX_USERS_PER_TICK)
     ).all()
+    if not due_user_ids:
+        return []
+
+    # Pull each account's oldest-due monitors SEPARATELY, so a large backlog on
+    # one account cannot displace another account's work before we ever see it.
+    # Fetch a little more than each account's fair share, so the second pass has
+    # material to top the batch up with once every account has been served.
+    per_user_cap_rows = max(1, int(limit * settings.max_batch_share_per_user))
+    per_user_fetch = min(
+        limit, max(per_user_cap_rows * 2, -(-limit // len(due_user_ids)) + 1)
+    )
+    if len(due_user_ids) == 1:
+        per_user_fetch = limit
+
+    by_user: dict[int, list[Monitor]] = {}
+    for user_id in due_user_ids:
+        by_user[user_id] = db.scalars(
+            select(Monitor)
+            .where(Monitor.is_active.is_(True))
+            .where(Monitor.next_check_at <= now)
+            .where(Monitor.user_id == user_id)
+            .order_by(Monitor.next_check_at)
+            .limit(per_user_fetch)
+        ).all()
+
+    candidates = _interleave_by_user(by_user)
 
     claimed: list[Monitor] = []
-    for monitor in candidates:
+    taken_per_user: dict[int, int] = {}
+
+    # Fairness cap: ORDER BY next_check_at alone lets one account whose monitors
+    # are all due fill the entire batch. Measured with 45 hanging monitors from
+    # one user, a tick took 125s at production timeouts, leaving a second user's
+    # 60s-interval monitors permanently late.
+    #
+    # Two passes, so fairness costs nothing when there is no contention:
+    #   pass 1 honours the per-user cap;
+    #   pass 2 fills any slots still free, ignoring the cap.
+    # With one active user the batch still fills completely; with many, no
+    # single user can crowd the others out.
+    per_user_cap = max(1, int(limit * settings.max_batch_share_per_user))
+
+    def _try_claim(monitor: Monitor, cap: int | None) -> bool:
+        if cap is not None and taken_per_user.get(monitor.user_id, 0) >= cap:
+            return False
+
         user = db.get(User, monitor.user_id)
         if user is None or not user.is_active:
-            continue
+            return False
 
         plan = get_plan(user.plan)
         usage = db.scalar(
@@ -215,23 +339,45 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
             )
             db.commit()
             log.info("monitor_skipped_quota", monitor_id=monitor.id, user_id=user.id, plan=plan.key)
-            continue
+            return False
 
         # A downgrade must not leave a monitor running faster than the plan allows.
         interval = max(monitor.interval_seconds, plan.min_interval_seconds)
 
+        # Claim with a SHORT LEASE, not the full interval. run_check() sets the
+        # real next_check_at when it finishes; if this process dies first the
+        # lease expires in claim_lease_seconds and another worker retries,
+        # instead of the check being silently skipped for a whole interval.
+        lease_until = now + timedelta(seconds=min(settings.claim_lease_seconds, interval))
         result = db.execute(
             update(Monitor)
             .where(Monitor.id == monitor.id, Monitor.next_check_at <= now)
-            .values(next_check_at=now + timedelta(seconds=interval), interval_seconds=interval)
+            .values(next_check_at=lease_until, interval_seconds=interval)
         )
         db.commit()
 
-        if result.rowcount == 1:
-            db.refresh(monitor)
-            claimed.append(monitor)
-        else:
+        if result.rowcount != 1:
             # Another worker got there first between our SELECT and UPDATE.
             log.debug("monitor_claim_lost", monitor_id=monitor.id)
+            return False
+
+        db.refresh(monitor)
+        taken_per_user[monitor.user_id] = taken_per_user.get(monitor.user_id, 0) + 1
+        claimed.append(monitor)
+        return True
+
+    remaining: list[Monitor] = []
+    for monitor in candidates:
+        if len(claimed) >= limit:
+            break
+        if not _try_claim(monitor, per_user_cap):
+            remaining.append(monitor)
+
+    # Any slots still free go to whoever is waiting, cap ignored - fairness must
+    # not cost throughput when there is no contention.
+    for monitor in remaining:
+        if len(claimed) >= limit:
+            break
+        _try_claim(monitor, None)
 
     return claimed

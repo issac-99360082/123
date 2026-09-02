@@ -126,7 +126,7 @@ app/
     billing.py       Stripe checkout / portal / webhook
     health.py        healthz / readyz / metrics
 templates/           首頁與付款結果頁
-tests/               126 個測試(含 23 個 audit 回歸測試)
+tests/               142 個測試(含 39 個 audit 與故障注入回歸測試)
 scripts/             install.sh、smoke_test.sh
 docs/                選型分析、單位經濟、SETUP、DEPLOY、API
 ```
@@ -188,7 +188,7 @@ docs/                選型分析、單位經濟、SETUP、DEPLOY、API
 ## 測試
 
 ```bash
-python -m pytest -q          # 126 passed
+python -m pytest -q          # 142 passed
 ```
 
 | 檔案 | 涵蓋範圍 |
@@ -217,6 +217,7 @@ python -m pytest -q          # 126 passed
 | [`docs/API.md`](docs/API.md) | 完整 API 參考與 webhook 簽章驗證範例 |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | 威脅模型與**殘餘風險**(上線前必讀) |
 | [`audit_1.md`](audit_1.md) / [`audit_2.md`](audit_2.md) | 兩輪敵意 production-readiness audit 與修正紀錄 |
+| [`AUDIT_02_FAULT_INJECTION.md`](AUDIT_02_FAULT_INJECTION.md) | 故障注入、壓力與恢復能力稽核;**含實測負載範圍** |
 
 ---
 

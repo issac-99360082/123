@@ -50,10 +50,25 @@ class Settings(BaseSettings):
 
     # --- Scheduler / worker -------------------------------------------------
     scheduler_enabled: bool = True
-    scheduler_tick_seconds: int = 20
-    worker_concurrency: int = 8
-    check_batch_size: int = 50
+    # Sustained check capacity is check_batch_size / scheduler_tick_seconds, and
+    # nothing else. The original defaults (50/20s = 2.5 checks/s) were below what
+    # a single Business customer needs at the advertised limits (300 monitors on
+    # a 60s interval = 5 checks/s), so the plans on the pricing page could not be
+    # delivered by the shipped configuration. See capacity_report().
+    scheduler_tick_seconds: int = 10
+    worker_concurrency: int = 16
+    check_batch_size: int = 200
     consecutive_failures_before_pause: int = 20
+    # A claim is a LEASE, not a reschedule. If the worker dies mid-check the
+    # lease expires and the work is retried, instead of being silently skipped
+    # until the monitor's next natural slot.
+    claim_lease_seconds: int = 180
+    # Fairness: no single account may take more than this share of one batch,
+    # so one user with many due monitors cannot delay everybody else.
+    max_batch_share_per_user: float = 0.25
+    # How many times an empty extraction must repeat before it is accepted as a
+    # real change. Guards against transient blank pages during a deploy.
+    empty_content_confirmations: int = 2
 
     # --- Notifications ------------------------------------------------------
     webhook_timeout_seconds: float = 10.0
@@ -117,6 +132,32 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def sustained_checks_per_second(self) -> float:
+        """The scheduler claims at most check_batch_size monitors per tick, so
+        this - not CPU - is the ceiling on how many checks the deployment can
+        actually sustain."""
+        return self.check_batch_size / max(1, self.scheduler_tick_seconds)
+
+    def capacity_report(self) -> dict:
+        """Configured capacity versus what the plans promise, for startup logging."""
+        from app.plans import PLANS
+
+        capacity = self.sustained_checks_per_second
+        worst_plan = max(
+            PLANS.values(), key=lambda p: p.max_monitors / p.min_interval_seconds
+        )
+        required = worst_plan.max_monitors / worst_plan.min_interval_seconds
+        return {
+            "sustained_checks_per_second": round(capacity, 2),
+            "checks_per_month": int(capacity * 86_400 * 30),
+            "monitors_at_1min": int(capacity * 60),
+            "monitors_at_5min": int(capacity * 300),
+            "largest_plan": worst_plan.key,
+            "largest_plan_requires_checks_per_second": round(required, 2),
+            "can_serve_one_largest_plan_customer": capacity >= required,
+        }
 
 
 @lru_cache

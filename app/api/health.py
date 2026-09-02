@@ -17,6 +17,15 @@ from app.models import Delivery, DeliveryStatus, Monitor, User
 router = APIRouter(tags=["system"])
 
 
+def _age_seconds(timestamp, now) -> int | None:
+    """Seconds since `timestamp`, or None when there is nothing waiting."""
+    if timestamp is None:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return max(0, int((now - timestamp).total_seconds()))
+
+
 @router.get("/healthz")
 def healthz() -> dict:
     """Liveness: the process is up. Never touches the database."""
@@ -71,4 +80,25 @@ def metrics(
         "deliveries_failed": db.scalar(
             select(func.count(Delivery.id)).where(Delivery.status == DeliveryStatus.failed.value)
         ) or 0,
+        # Depth alone hides a stalled queue: 100 pending could be a healthy burst
+        # or one delivery wedged for an hour. Age is the number that tells you
+        # which, and it is what a latency alert should watch.
+        "oldest_pending_delivery_age_seconds": _age_seconds(
+            db.scalar(
+                select(func.min(Delivery.created_at)).where(
+                    Delivery.status == DeliveryStatus.pending.value
+                )
+            ),
+            now,
+        ),
+        # Same argument for checks: monitors_due says how many are late,
+        # this says how late the worst one is.
+        "oldest_due_monitor_age_seconds": _age_seconds(
+            db.scalar(
+                select(func.min(Monitor.next_check_at)).where(
+                    Monitor.is_active.is_(True), Monitor.next_check_at <= now
+                )
+            ),
+            now,
+        ),
     }

@@ -219,6 +219,25 @@ _robots = RobotsCache()
 # Fetch
 # --------------------------------------------------------------------------
 
+def _classify_http_error(exc: Exception) -> str:
+    """Map an httpx transport failure onto a stable, actionable error kind."""
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    if isinstance(exc, httpx.ConnectError):
+        if "certificate" in text or "ssl" in text or "tls" in text:
+            return "tls_error"
+        if "name or service not known" in text or "temporary failure in name resolution" in text \
+                or "nodename nor servname" in text or "getaddrinfo" in text:
+            return "dns_error"
+        if "refused" in text:
+            return "connection_refused"
+        return "connection_failed"
+    if isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)):
+        return "connection_reset"
+    if "certificate" in text or "ssl" in text:
+        return "tls_error"
+    return "network_error"
+
+
 def fetch(
     url: str,
     method: str = "GET",
@@ -302,6 +321,14 @@ def fetch(
                     total = 0
                     truncated = False
                     for chunk in response.iter_bytes():
+                        # The deadline must be enforced DURING the body read, not
+                        # only between redirect hops. httpx timeouts are per
+                        # socket operation, so a server that trickles one small
+                        # chunk just under the timeout, forever, never trips them:
+                        # measured holding a worker thread for 60s against a 12s
+                        # deadline. That is a slow-loris against our own pool.
+                        if time.perf_counter() >= deadline:
+                            raise FetchError("deadline_exceeded", _DEADLINE_MESSAGE)
                         chunks.append(chunk)
                         total += len(chunk)
                         if total >= settings.fetch_max_bytes:
@@ -327,7 +354,11 @@ def fetch(
                     "timeout", f"Request timed out after {settings.fetch_timeout_seconds}s"
                 ) from exc
             except httpx.HTTPError as exc:
-                raise FetchError("network_error", f"{exc.__class__.__name__}: {exc}") from exc
+                # Distinguish the common failures. Collapsing them all into
+                # "network_error" leaves a user unable to tell an expired
+                # certificate from a dead DNS record from a refused port, which
+                # are three completely different things to go and fix.
+                raise FetchError(_classify_http_error(exc), f"{exc.__class__.__name__}: {exc}") from exc
 
     raise FetchError(
         "too_many_redirects",

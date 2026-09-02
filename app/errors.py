@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError, OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.logging_conf import get_logger
@@ -104,6 +105,26 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content=_payload(mapping.get(exc.status_code, "http_error"), str(exc.detail)),
             headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(OperationalError)
+    @app.exception_handler(DBAPIError)
+    async def _database_unavailable(request: Request, exc: Exception):
+        # A database outage is a dependency failure, not a bug in the request.
+        # Reporting it as 500 tells clients and load balancers to give up;
+        # 503 + Retry-After tells them to come back, which is what we want.
+        ref = uuid.uuid4().hex[:12]
+        log.error(
+            "database_unavailable", ref=ref, path=request.url.path,
+            error=exc.__class__.__name__,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=_payload(
+                "service_unavailable",
+                f"The service is temporarily unable to reach its database. Reference: {ref}",
+            ),
+            headers={"Retry-After": "15"},
         )
 
     @app.exception_handler(Exception)

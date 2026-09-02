@@ -40,6 +40,21 @@ async def lifespan(_: FastAPI):
     if settings.is_production and settings.secret_key == "dev-insecure-secret-change-me":
         raise RuntimeError("SECRET_KEY must be set to a real value in production.")
 
+    capacity = settings.capacity_report()
+    log.info("scheduler_capacity", **capacity)
+    if not capacity["can_serve_one_largest_plan_customer"]:
+        # Selling a plan the deployment cannot serve produces missed checks that
+        # look like product failure, so say it at boot rather than discovering it
+        # from a customer complaint.
+        log.warning(
+            "capacity_below_advertised_plan",
+            message=(
+                "check_batch_size / scheduler_tick_seconds is below what the largest "
+                "plan promises; raise CHECK_BATCH_SIZE or lower SCHEDULER_TICK_SECONDS"
+            ),
+            **capacity,
+        )
+
     scheduler_started = False
     if settings.scheduler_enabled:
         from app.core.scheduler import start_scheduler, stop_scheduler

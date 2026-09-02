@@ -126,8 +126,29 @@ sudo systemctl status watchpost-api watchpost-worker
 | 1 | 起步 | 單機、SQLite、排程器在 API 內 |
 | 2 | 監控數 > 幾百 | 換 Postgres，worker 拆成獨立程序 |
 | 3 | API 延遲上升 | API 加 `--workers`，或多台 API 副本 |
-| 4 | 檢查開始延遲 | 提高 `WORKER_CONCURRENCY` 與 `CHECK_BATCH_SIZE` |
+| 4 | 檢查開始延遲 | 提高 `WORKER_CONCURRENCY` 與 `CHECK_BATCH_SIZE`(見下方容量公式) |
 | 5 | 單一 worker 不足 | 見下方「多 worker」 |
+
+### 容量公式(故障注入輪新增)
+
+```
+持續容量 = CHECK_BATCH_SIZE / SCHEDULER_TICK_SECONDS   (checks/秒)
+```
+
+這是**唯一**決定持續吞吐量的因素,與 CPU 無關。它必須大於你最大方案所需:
+
+| 方案 | 滿載所需 | 單機可容納 |
+|---|---|---|
+| Free(3 監控 / 60 分) | 0.0008 checks/s | 約 24,000 位 |
+| Pro(50 監控 / 5 分) | 0.17 checks/s | 約 120 位 |
+| Business(300 監控 / 1 分) | 5.0 checks/s | 約 4 位 |
+
+預設值 `200 / 10s = 20 checks/s`,實測突發吞吐量 16.1 checks/s。
+**應用程式啟動時會記錄容量,並在低於最大方案所需時發出
+`capacity_below_advertised_plan` 警告。**
+
+> 稽核中發現原本的預設值(50/20s = 2.5 checks/s)**低於 Business 方案
+> 單一客戶所需的 5 checks/s** —— 賣得出去但交付不了。
 
 ### 多 worker
 

@@ -193,16 +193,42 @@ class _PermanentEventError(Exception):
     """The event can never be processed successfully; retrying is pointless."""
 
 
-def _process_event(db: Session, event_type: str, obj: dict) -> None:
-    """Apply one Stripe event. Raises on transient failure so the caller can 500
+def _is_stale(user: User, event_created: int | None) -> bool:
+    """True when this event is older than the newest one already applied.
+
+    Stripe explicitly does not guarantee webhook ordering. Measured without this
+    guard: a cancellation was applied, then a stale `subscription.updated` that
+    Stripe delivered late re-upgraded the cancelled account to Pro, which then
+    kept paid features indefinitely with no active subscription.
+    """
+    if event_created is None or user.last_stripe_event_at is None:
+        return False
+    return event_created < user.last_stripe_event_at
+
+
+def _mark_applied(db: Session, user: User, event_created: int | None) -> None:
+    if event_created is not None:
+        if user.last_stripe_event_at is None or event_created > user.last_stripe_event_at:
+            user.last_stripe_event_at = event_created
+            db.commit()
+
+
+def _process_event(
+    db: Session, event_type: str, obj: dict, event_created: int | None = None
+) -> None:
+    """Apply one Stripe event. Raises on transient failure so the caller can 503
     and let Stripe redeliver."""
     if event_type == "checkout.session.completed":
         user = _find_user(db, obj)
+        if user and _is_stale(user, event_created):
+            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
+            return
         if user and obj.get("subscription"):
             if not user.stripe_customer_id and obj.get("customer"):
                 user.stripe_customer_id = obj["customer"]
             subscription = stripe.Subscription.retrieve(obj["subscription"])
             _apply_subscription(db, user, dict(subscription))
+            _mark_applied(db, user, event_created)
 
     elif event_type in {
         "customer.subscription.created",
@@ -210,6 +236,9 @@ def _process_event(db: Session, event_type: str, obj: dict) -> None:
         "customer.subscription.deleted",
     }:
         user = _find_user(db, obj)
+        if user and _is_stale(user, event_created):
+            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
+            return
         if user:
             if event_type == "customer.subscription.deleted":
                 user.plan = Plan.free.value
@@ -219,12 +248,17 @@ def _process_event(db: Session, event_type: str, obj: dict) -> None:
                 log.info("subscription_cancelled", user_id=user.id)
             else:
                 _apply_subscription(db, user, dict(obj))
+            _mark_applied(db, user, event_created)
 
     elif event_type == "invoice.payment_failed":
         user = _find_user(db, obj)
+        if user and _is_stale(user, event_created):
+            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
+            return
         if user:
             user.subscription_status = "past_due"
             db.commit()
+            _mark_applied(db, user, event_created)
             log.warning("invoice_payment_failed", user_id=user.id)
 
     else:
@@ -265,7 +299,7 @@ async def stripe_webhook(
     # fails, the customer has paid, the plan was never granted, and Stripe's
     # redelivery is then discarded as a duplicate.
     try:
-        _process_event(db, event_type, obj)
+        _process_event(db, event_type, obj, event.get("created"))
     except stripe.StripeError as exc:
         db.rollback()
         log.error(
@@ -283,8 +317,18 @@ async def stripe_webhook(
             "Event processing failed; please redeliver."
         ) from exc
 
-    db.add(StripeEvent(id=event_id, type=event_type))
-    db.commit()
+    # This commit must be protected too. Left outside the try/except it became
+    # the one unguarded write on the path: under concurrent redelivery it raised
+    # a database lock error straight into the generic 500 handler (measured: 6
+    # of 8 concurrent webhooks returned 500).
+    try:
+        db.add(StripeEvent(id=event_id, type=event_type))
+        db.commit()
+    except Exception:
+        db.rollback()
+        # The work itself already succeeded and every branch is idempotent, so a
+        # redelivery is safe; failing to record the id only risks re-applying it.
+        log.warning("stripe_event_record_failed", event_id=event_id, type=event_type)
 
     return MessageOut(message="ok")
 

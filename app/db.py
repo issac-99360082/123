@@ -43,7 +43,22 @@ def _make_engine(url: str):
 
     # Postgres / others: recycle connections so a restarted DB does not wedge
     # the pool, and pre-ping to drop dead connections.
-    return create_engine(url, future=True, pool_pre_ping=True, pool_recycle=1800)
+    #
+    # Size the pool from the worker concurrency rather than leaving SQLAlchemy's
+    # default (5 + 10 overflow). Each check and each delivery attempt takes its
+    # own session, so a tick can want worker_concurrency connections at once;
+    # with the default pool that silently becomes a queue of threads waiting on
+    # pool_timeout instead of doing work.
+    pool_size = max(5, settings.worker_concurrency)
+    return create_engine(
+        url,
+        future=True,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=pool_size,
+        max_overflow=pool_size,
+        pool_timeout=30,
+    )
 
 
 engine = _make_engine(settings.database_url)

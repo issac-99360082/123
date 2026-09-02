@@ -71,6 +71,10 @@ class User(Base):
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(64), index=True)
     subscription_status: Mapped[str | None] = mapped_column(String(32))
     current_period_end: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # Unix timestamp of the newest Stripe event already applied to this account.
+    # Stripe does not guarantee delivery order, so without this a stale event can
+    # overwrite a newer one.
+    last_stripe_event_at: Mapped[int | None] = mapped_column(Integer)
 
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     monitors: Mapped[list["Monitor"]] = relationship(back_populates="user", cascade="all, delete-orphan")
