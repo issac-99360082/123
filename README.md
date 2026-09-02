@@ -1,5 +1,18 @@
 # Watchpost
 
+> ## ⚠️ 商業驗收結論:**Pivot** —— 在驗證需求之前,請勿再開發任何功能
+>
+> 第五輪商業驗收([`AUDIT_03_BUSINESS_VALIDATION.md`](AUDIT_03_BUSINESS_VALIDATION.md))
+> 的結論是:本專案目前**沒有不可替代的優勢**,而且面對一個免費、開源、
+> 功能更完整的領導者([changedetection.io](https://github.com/dgtlmoon/changedetection.io),
+> 33.5k stars,託管版 $8.99/月)。
+>
+> 保守漏斗模型顯示:**每 9,895 名訪客才會產生 1 位付費客戶**,
+> $500 MRR 需要約 260,000 名訪客 —— 對沒有受眾的獨立開發者不可行。
+>
+> **下一步不是寫程式,是用一週、NT$0 做人工需求驗證**(見該文件第 10 節)。
+> 下方的定價與方案設計**尚未經過任何市場驗證**,請視為假設而非事實。
+
 **開發者導向的網頁／API 變更監控服務。**
 
 監看任何公開 URL 或 JSON API，只擷取你在意的那一小塊內容，
@@ -218,6 +231,7 @@ python -m pytest -q          # 142 passed
 | [`docs/SECURITY.md`](docs/SECURITY.md) | 威脅模型與**殘餘風險**(上線前必讀) |
 | [`audit_1.md`](audit_1.md) / [`audit_2.md`](audit_2.md) | 兩輪敵意 production-readiness audit 與修正紀錄 |
 | [`AUDIT_02_FAULT_INJECTION.md`](AUDIT_02_FAULT_INJECTION.md) | 故障注入、壓力與恢復能力稽核;**含實測負載範圍** |
+| [`AUDIT_03_BUSINESS_VALIDATION.md`](AUDIT_03_BUSINESS_VALIDATION.md) | **商業可行性敵對驗收**:競品、定價、漏斗、pre-mortem、verdict |
 
 ---
 
