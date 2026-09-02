@@ -11,6 +11,10 @@
 > $500 MRR 需要約 260,000 名訪客 —— 對沒有受眾的獨立開發者不可行。
 >
 > **下一步不是寫程式,是用一週、NT$0 做人工需求驗證**(見該文件第 10 節)。
+>
+> 第六輪已選定 Pivot 方向:[`AUDIT_04_PIVOT_SELECTION.md`](AUDIT_04_PIVOT_SELECTION.md)
+> —— **進出口貿易法規/關稅變更監控,賣給報關行與貿易顧問**。
+> 既有程式碼中 **53% 的核心引擎保留、45% 的自助 SaaS 外殼凍結**。
 > 下方的定價與方案設計**尚未經過任何市場驗證**,請視為假設而非事實。
 
 **開發者導向的網頁／API 變更監控服務。**
@@ -232,6 +236,7 @@ python -m pytest -q          # 142 passed
 | [`audit_1.md`](audit_1.md) / [`audit_2.md`](audit_2.md) | 兩輪敵意 production-readiness audit 與修正紀錄 |
 | [`AUDIT_02_FAULT_INJECTION.md`](AUDIT_02_FAULT_INJECTION.md) | 故障注入、壓力與恢復能力稽核;**含實測負載範圍** |
 | [`AUDIT_03_BUSINESS_VALIDATION.md`](AUDIT_03_BUSINESS_VALIDATION.md) | **商業可行性敵對驗收**:競品、定價、漏斗、pre-mortem、verdict |
+| [`AUDIT_04_PIVOT_SELECTION.md`](AUDIT_04_PIVOT_SELECTION.md) | **垂直市場選擇**:14 個方向評分、敏感度分析、pre-mortem、最終推薦與 MVP 範圍 |
 
 ---
 
