@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     fetch_timeout_seconds: float = 20.0
     fetch_max_bytes: int = 2_000_000
     fetch_max_redirects: int = 5
+    # Wall-clock ceiling for ONE check, across every redirect hop and throttle
+    # wait. Without it, a redirect chain multiplies fetch_timeout by the hop
+    # count and a hostile site can hold a worker thread for minutes.
+    fetch_total_deadline_seconds: float = 45.0
     respect_robots_txt: bool = True
     min_seconds_between_hits_per_host: int = 20
     allow_private_network_targets: bool = False  # SSRF guard; keep false in production
@@ -82,6 +86,20 @@ class Settings(BaseSettings):
     signup_limit_per_hour_per_ip: int = 5
     login_max_failures: int = 8
     login_lockout_minutes: int = 15
+    # A single account may absorb this many failures across ALL addresses before
+    # it locks. Set well above login_max_failures: a per-account lock that trips
+    # too easily lets anyone who knows an email deny that user access.
+    login_max_failures_global: int = 50
+
+    # X-Forwarded-For is only meaningful behind a proxy that OVERWRITES it.
+    # Exposed directly, the client sets it freely and picks its own rate-limit
+    # bucket, which defeats every per-IP control. Off unless you run a proxy.
+    trust_proxy_headers: bool = False
+
+    # --- Retention ----------------------------------------------------------
+    retention_enabled: bool = True
+    retention_sweep_minutes: int = 60
+    retention_batch_size: int = 5_000
 
     @field_validator("public_base_url")
     @classmethod

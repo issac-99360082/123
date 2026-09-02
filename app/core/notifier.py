@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import json
 import smtplib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -196,8 +197,36 @@ def attempt_delivery(db: Session, delivery: Delivery) -> bool:
     return True
 
 
+def _attempt_in_own_session(delivery_id: int) -> None:
+    """One delivery, one session - so a slow or failing receiver is isolated."""
+    from app.db import session_scope
+
+    try:
+        with session_scope() as db:
+            delivery = db.get(Delivery, delivery_id)
+            if delivery is None or delivery.status != DeliveryStatus.pending.value:
+                return
+            attempt_delivery(db, delivery)
+    except Exception:
+        log.exception("delivery_attempt_crashed", delivery_id=delivery_id)
+        try:
+            with session_scope() as db:
+                delivery = db.get(Delivery, delivery_id)
+                if delivery is not None:
+                    delivery.status = DeliveryStatus.failed.value
+                    delivery.last_error = "internal error during delivery"
+        except Exception:
+            log.exception("delivery_failure_record_failed", delivery_id=delivery_id)
+
+
 def process_pending_deliveries(db: Session, limit: int = 50) -> int:
-    """Drain the delivery queue. Called on every scheduler tick."""
+    """Drain the delivery queue. Called on every scheduler tick.
+
+    Deliveries run CONCURRENTLY. Sequentially, one customer whose endpoint sits
+    at the webhook timeout holds up everyone behind them: a batch of 50 against
+    a 10s timeout occupies the tick for up to 500s, so unrelated customers get
+    their alerts minutes late because of a stranger's broken server.
+    """
     now = datetime.now(timezone.utc)
     pending = db.scalars(
         select(Delivery)
@@ -207,14 +236,21 @@ def process_pending_deliveries(db: Session, limit: int = 50) -> int:
         .limit(limit)
     ).all()
 
-    processed = 0
-    for delivery in pending:
-        try:
-            attempt_delivery(db, delivery)
-        except Exception:
-            log.exception("delivery_attempt_crashed", delivery_id=delivery.id)
-            delivery.status = DeliveryStatus.failed.value
-            delivery.last_error = "internal error during delivery"
-        processed += 1
+    delivery_ids = [d.id for d in pending]
+    if not delivery_ids:
+        return 0
+
+    # Claim the batch before releasing the session, so a second worker running
+    # its own tick does not send the same webhook again.
+    db.execute(
+        update(Delivery)
+        .where(Delivery.id.in_(delivery_ids))
+        .values(next_attempt_at=now + timedelta(seconds=settings.webhook_timeout_seconds * 2))
+    )
     db.commit()
-    return processed
+
+    workers = max(1, min(settings.worker_concurrency, len(delivery_ids)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_attempt_in_own_session, delivery_ids))
+
+    return len(delivery_ids)

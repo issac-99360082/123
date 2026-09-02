@@ -19,6 +19,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import settings
 from app.core.engine import claim_due_monitors, run_check
 from app.core.notifier import process_pending_deliveries
+from app.core.retention import sweep as retention_sweep
 from app.db import session_scope
 from app.logging_conf import get_logger
 
@@ -69,6 +70,16 @@ def tick() -> dict:
         _tick_lock.release()
 
 
+def run_retention() -> dict:
+    """Delete history past each plan's retention window."""
+    try:
+        with session_scope() as db:
+            return retention_sweep(db)
+    except Exception:
+        log.exception("retention_sweep_failed")
+        return {"error": True}
+
+
 _scheduler: BackgroundScheduler | None = None
 
 
@@ -87,6 +98,15 @@ def start_scheduler() -> BackgroundScheduler:
         coalesce=True,
         misfire_grace_time=settings.scheduler_tick_seconds * 3,
     )
+    if settings.retention_enabled:
+        _scheduler.add_job(
+            run_retention,
+            "interval",
+            minutes=settings.retention_sweep_minutes,
+            id="watchpost_retention",
+            max_instances=1,
+            coalesce=True,
+        )
     _scheduler.start()
     log.info("scheduler_started", tick_seconds=settings.scheduler_tick_seconds)
     return _scheduler

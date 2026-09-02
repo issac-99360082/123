@@ -285,3 +285,208 @@ def test_concurrent_workers_never_claim_the_same_monitor(tmp_path):
     assert len(claimed) == len(set(claimed)), "a monitor was claimed by more than one worker"
     assert len(claimed) == 40
     engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# audit_2 - findings from the second round
+# ---------------------------------------------------------------------------
+
+def test_forwarded_header_cannot_buy_extra_signups(client, monkeypatch):
+    """Round 1 keyed the throttle on X-Forwarded-For unconditionally, which the
+    client controls: measured 20/20 accounts against a limit of 5."""
+    monkeypatch.setattr(settings, "trust_proxy_headers", False)
+    created = 0
+    for i in range(20):
+        r = client.post(
+            "/v1/auth/signup",
+            json={"email": f"spoof{i}@throwaway.example", "password": "correct-horse-42"},
+            headers={"X-Forwarded-For": f"198.51.100.{i}"},
+        )
+        if r.status_code == 201:
+            created += 1
+    assert created == settings.signup_limit_per_hour_per_ip
+
+
+def test_lockout_does_not_let_a_stranger_deny_a_user_their_account(client, account, monkeypatch):
+    """Brute-force protection must not become a denial-of-service tool.
+
+    Round 1 locked purely on the account, so 8 failures from anywhere denied the
+    owner access - anyone who knew an email could lock it at will. The lock is
+    now primarily per (account, source); the account-wide tier sits far higher.
+
+    Proxy trust is enabled here only so the test can present distinct client
+    addresses; TestClient otherwise reports a single source for every request.
+    """
+    monkeypatch.setattr(settings, "trust_proxy_headers", True)
+
+    for i in range(settings.login_max_failures + 4):
+        client.post(
+            "/v1/auth/login",
+            json={"email": "dev@example.com", "password": f"bad{i}"},
+            headers={"X-Forwarded-For": f"203.0.113.{i}"},
+        )
+
+    # The real owner, from their own address, can still get in.
+    assert (
+        client.post(
+            "/v1/auth/login",
+            json={"email": "dev@example.com", "password": "correct-horse-42"},
+            headers={"X-Forwarded-For": "198.51.100.7"},
+        ).status_code
+        == 200
+    )
+
+
+def test_repeated_failures_from_one_source_still_lock_out(client, account, monkeypatch):
+    """The relaxed lockout must not have disarmed brute-force protection."""
+    monkeypatch.setattr(settings, "trust_proxy_headers", True)
+    codes = [
+        client.post(
+            "/v1/auth/login",
+            json={"email": "dev@example.com", "password": f"bad{i}"},
+            headers={"X-Forwarded-For": "203.0.113.9"},
+        ).status_code
+        for i in range(settings.login_max_failures + 4)
+    ]
+    assert codes.count(401) == settings.login_max_failures
+    assert 429 in codes
+
+
+def test_account_wide_tier_still_stops_a_distributed_attack(client, account, monkeypatch):
+    """Many addresses, one account: the loose account-wide tier must eventually trip."""
+    monkeypatch.setattr(settings, "trust_proxy_headers", True)
+    codes = []
+    for i in range(settings.login_max_failures_global + 5):
+        codes.append(
+            client.post(
+                "/v1/auth/login",
+                json={"email": "dev@example.com", "password": f"bad{i}"},
+                headers={"X-Forwarded-For": f"203.0.{i // 250}.{i % 250}"},
+            ).status_code
+        )
+    assert 429 in codes, "a distributed guesser was never stopped"
+    assert codes.count(401) <= settings.login_max_failures_global
+
+
+def test_fetch_has_a_total_deadline_across_redirect_hops(monkeypatch):
+    """The round-1 redirect fix throttles every hop, so a redirect chain
+    multiplied wall time: measured 15s at a 3s gap, ~100s at the production 20s."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Chain(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/next")
+            self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", 0), _Chain)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(settings, "allow_private_network_targets", True)
+    monkeypatch.setattr(settings, "min_seconds_between_hits_per_host", 5)
+    monkeypatch.setattr(settings, "fetch_total_deadline_seconds", 3.0)
+    try:
+        started = time.perf_counter()
+        with pytest.raises(FetchError) as exc:
+            fetch(f"http://127.0.0.1:{srv.server_address[1]}/", respect_robots=False)
+        elapsed = time.perf_counter() - started
+        assert exc.value.kind in {"deadline_exceeded", "too_many_redirects"}
+        assert elapsed < 10.0, f"one check occupied a worker for {elapsed:.1f}s"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_account_deletion_removes_everything(client, account, db):
+    """terms.md promises deletion; verify it actually cascades."""
+    from app.models import ApiKey, ChangeEvent, Check, Monitor, User
+
+    created = client.post(
+        "/v1/monitors",
+        json={
+            "name": "to delete", "url": "https://example.com/p", "extract_mode": "text",
+            "interval_seconds": 3600, "notify_webhook_url": "https://example.com/hook",
+        },
+        headers=account["headers"],
+    ).json()
+    monitor_id = created["id"]
+
+    monitor = db.get(Monitor, monitor_id)
+    db.add(Check(monitor_id=monitor_id, status="unchanged"))
+    db.add(ChangeEvent(monitor_id=monitor_id, old_hash="a", new_hash="b", diff={}))
+    db.commit()
+    user_id = monitor.user_id
+
+    # Wrong confirmation must not delete anything.
+    assert client.request(
+        "DELETE", "/v1/auth/me", params={"confirm": "wrong@example.com"},
+        headers=account["headers"],
+    ).status_code == 400
+    assert db.get(User, user_id) is not None
+
+    assert client.request(
+        "DELETE", "/v1/auth/me", params={"confirm": "dev@example.com"},
+        headers=account["headers"],
+    ).status_code == 200
+
+    db.expire_all()
+    assert db.get(User, user_id) is None
+    assert db.query(Monitor).filter(Monitor.id == monitor_id).count() == 0
+    assert db.query(ApiKey).filter(ApiKey.user_id == user_id).count() == 0
+    assert db.query(Check).filter(Check.monitor_id == monitor_id).count() == 0
+    assert db.query(ChangeEvent).filter(ChangeEvent.monitor_id == monitor_id).count() == 0
+
+
+def test_account_export_returns_the_users_data(client, account):
+    client.post(
+        "/v1/monitors",
+        json={
+            "name": "exported", "url": "https://example.com/p", "extract_mode": "text",
+            "interval_seconds": 3600, "notify_webhook_url": "https://example.com/hook",
+        },
+        headers=account["headers"],
+    )
+    body = client.get("/v1/auth/me/export", headers=account["headers"]).json()
+    assert body["account"]["email"] == "dev@example.com"
+    assert [m["name"] for m in body["monitors"]] == ["exported"]
+
+
+def test_retention_actually_deletes_history_past_the_plan_window(client, account, db):
+    """history_days was only used to filter queries - nothing deleted rows, so
+    storage grew without bound and the cost model was wrong."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.retention import storage_stats, sweep
+    from app.models import ChangeEvent, Check, Monitor
+
+    created = client.post(
+        "/v1/monitors",
+        json={
+            "name": "retained", "url": "https://example.com/p", "extract_mode": "text",
+            "interval_seconds": 3600, "notify_webhook_url": "https://example.com/hook",
+        },
+        headers=account["headers"],
+    ).json()
+    monitor_id = created["id"]
+
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=40)          # free plan keeps 7 days
+    for _ in range(5):
+        db.add(Check(monitor_id=monitor_id, status="unchanged", started_at=old))
+        db.add(ChangeEvent(monitor_id=monitor_id, old_hash="a", new_hash="b", diff={}, created_at=old))
+    for _ in range(3):
+        db.add(Check(monitor_id=monitor_id, status="unchanged", started_at=now))
+    db.commit()
+
+    assert storage_stats(db)["checks"] == 8
+    sweep(db)
+    db.expire_all()
+
+    stats = storage_stats(db)
+    assert stats["checks"] == 3, "stale checks were not pruned"
+    assert stats["change_events"] == 0, "stale change events were not pruned"
+    # The monitor itself must survive a retention sweep.
+    assert db.get(Monitor, monitor_id) is not None

@@ -215,5 +215,14 @@ class PortalSessionOut(BaseModel):
     portal_url: str
 
 
+class AccountExportOut(BaseModel):
+    """Everything the service holds about one account (privacy.md export right)."""
+
+    account: dict
+    monitors: list[dict]
+    checks: list[dict]
+    change_events: list[dict]
+
+
 class MessageOut(BaseModel):
     message: str

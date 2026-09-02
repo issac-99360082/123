@@ -174,19 +174,29 @@ class SlidingWindow:
 
 
 _signup_limiter = SlidingWindow(settings.signup_limit_per_hour_per_ip, 3600)
+# Two tiers, so brute-force protection does not become a denial-of-service tool.
+# Tight per (account, source) - that is the shape of an actual guessing attack.
 _login_failures = SlidingWindow(settings.login_max_failures, settings.login_lockout_minutes * 60)
+# Loose per account across all sources - a genuine distributed attack still
+# trips it, but one person spamming a known email cannot cheaply lock its owner out.
+_login_failures_global = SlidingWindow(
+    settings.login_max_failures_global, settings.login_lockout_minutes * 60
+)
 
 
 def client_ip(request: Request) -> str:
-    """Client address, honouring one layer of reverse proxy.
+    """Client address, trusting X-Forwarded-For only when configured to.
 
-    Only the first X-Forwarded-For entry is used, and only because the app is
-    documented as running behind a proxy that sets it. Do NOT expose the app
-    directly to the internet with this header trusted.
+    Honouring the header unconditionally is a self-inflicted bypass: the client
+    chooses the value, so it chooses its own rate-limit bucket. Measured with
+    the header trusted, one attacker created 20/20 accounts against a limit of
+    5. It is now used only when TRUST_PROXY_HEADERS is on, which is correct
+    exactly when a reverse proxy overwrites the header.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()[:64]
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()[:64]
     return (request.client.host if request.client else "anonymous")[:64]
 
 
@@ -205,25 +215,39 @@ def signup_rate_limit(request: Request) -> None:
         )
 
 
-def check_login_lockout(email: str) -> None:
-    allowed, retry_after = _login_failures.check(f"login:{email.lower()}")
-    if not allowed:
-        raise RateLimitError(
-            "Too many failed sign-in attempts for this account. Try again later.",
-            detail={"retry_after_seconds": round(retry_after, 1)},
-        )
+def check_login_lockout(email: str, source: str) -> None:
+    email = email.lower()
+    for limiter, key in (
+        (_login_failures, f"login:{email}:{source}"),
+        (_login_failures_global, f"login:{email}"),
+    ):
+        allowed, retry_after = limiter.check(key)
+        if not allowed:
+            raise RateLimitError(
+                "Too many failed sign-in attempts. Try again later.",
+                detail={"retry_after_seconds": round(retry_after, 1)},
+            )
 
 
-def record_login_failure(email: str) -> None:
-    _login_failures.record(f"login:{email.lower()}")
+def record_login_failure(email: str, source: str) -> None:
+    email = email.lower()
+    _login_failures.record(f"login:{email}:{source}")
+    _login_failures_global.record(f"login:{email}")
 
 
-def clear_login_failures(email: str) -> None:
-    _login_failures.reset(f"login:{email.lower()}")
+def clear_login_failures(email: str, source: str) -> None:
+    email = email.lower()
+    _login_failures.reset(f"login:{email}:{source}")
+    _login_failures_global.reset(f"login:{email}")
 
 
 def rate_limit(request: Request) -> None:
-    key = _extract_key(request) or (request.client.host if request.client else "anonymous")
+    # Authenticated callers are keyed on their API key. Anonymous callers fall
+    # back to their address via client_ip(), which respects TRUST_PROXY_HEADERS:
+    # using request.client.host directly would put every anonymous request
+    # behind a reverse proxy into ONE bucket, so a single abuser could stop all
+    # new signups for everybody.
+    key = _extract_key(request) or client_ip(request)
     allowed, retry_after = _limiter.consume(key[:64])
     if not allowed:
         raise RateLimitError(

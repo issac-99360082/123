@@ -29,6 +29,8 @@ from app.logging_conf import get_logger
 
 log = get_logger(__name__)
 
+_DEADLINE_MESSAGE = "Check exceeded its total time budget (redirects and throttling included)."
+
 ALLOWED_SCHEMES = {"http", "https"}
 ALLOWED_METHODS = {"GET", "HEAD", "POST"}
 
@@ -250,6 +252,7 @@ def fetch(
 
     current_url = url
     started = time.perf_counter()
+    deadline = started + settings.fetch_total_deadline_seconds
 
     with httpx.Client(
         timeout=settings.fetch_timeout_seconds,
@@ -265,7 +268,13 @@ def fetch(
                     "robots_disallowed", "robots.txt on the target site disallows this URL."
                 )
             if throttle:
-                _throttle.wait(urlparse(safe_url).netloc)
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise FetchError("deadline_exceeded", _DEADLINE_MESSAGE)
+                _throttle.wait(urlparse(safe_url).netloc, max_wait=remaining)
+
+            if time.perf_counter() >= deadline:
+                raise FetchError("deadline_exceeded", _DEADLINE_MESSAGE)
 
             # Only the first hop carries the body; a redirected request must not
             # replay a POST body at a different origin.
@@ -273,7 +282,12 @@ def fetch(
             hop_body = body if hop == 0 else None
 
             try:
-                with client.stream(hop_method, safe_url, content=hop_body) as response:
+                hop_timeout = min(
+                    settings.fetch_timeout_seconds, max(1.0, deadline - time.perf_counter())
+                )
+                with client.stream(
+                    hop_method, safe_url, content=hop_body, timeout=hop_timeout
+                ) as response:
                     if response.is_redirect:
                         location = response.headers.get("location")
                         if not location:

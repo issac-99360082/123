@@ -118,6 +118,7 @@ app/
     differ.py        結構化 diff（webhook payload 的核心產物）
     notifier.py      webhook / email 送達、簽章、指數退避重試
     engine.py        檢查主迴圈：fetch → extract → compare → notify
+    retention.py     依方案保留期限刪除過期歷史(成本控制)
     scheduler.py     APScheduler 排程與執行緒池
   api/
     auth.py          註冊、登入、API key 管理
@@ -125,7 +126,7 @@ app/
     billing.py       Stripe checkout / portal / webhook
     health.py        healthz / readyz / metrics
 templates/           首頁與付款結果頁
-tests/               103 個測試
+tests/               126 個測試(含 23 個 audit 回歸測試)
 scripts/             install.sh、smoke_test.sh
 docs/                選型分析、單位經濟、SETUP、DEPLOY、API
 ```
@@ -187,7 +188,7 @@ docs/                選型分析、單位經濟、SETUP、DEPLOY、API
 ## 測試
 
 ```bash
-python -m pytest -q          # 103 passed
+python -m pytest -q          # 126 passed
 ```
 
 | 檔案 | 涵蓋範圍 |
@@ -214,6 +215,8 @@ python -m pytest -q          # 103 passed
 | [`docs/SETUP.md`](docs/SETUP.md) | **需要你提供的資訊**（Stripe、網域、SMTP） |
 | [`docs/DEPLOY.md`](docs/DEPLOY.md) | 三種部署路徑、擴容、備份、上線檢查 |
 | [`docs/API.md`](docs/API.md) | 完整 API 參考與 webhook 簽章驗證範例 |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | 威脅模型與**殘餘風險**(上線前必讀) |
+| [`audit_1.md`](audit_1.md) / [`audit_2.md`](audit_2.md) | 兩輪敵意 production-readiness audit 與修正紀錄 |
 
 ---
 

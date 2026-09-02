@@ -46,7 +46,7 @@ API key 僅在建立時回傳一次；資料庫只保存 SHA-256 雜湊，遺失
 |---|---|---|
 | GET | `/healthz` | 存活檢查，不碰資料庫 |
 | GET | `/readyz` | 就緒檢查（資料庫、billing、email） |
-| GET | `/metrics` | 營運計數 |
+| GET | `/metrics` | 營運計數(**需要 API key**) |
 
 ### 認證
 
@@ -58,6 +58,8 @@ API key 僅在建立時回傳一次；資料庫只保存 SHA-256 雜湊，遺失
 | GET | `/v1/auth/keys` | 列出 API keys（不含明文） |
 | POST | `/v1/auth/keys` | 建立新的 API key |
 | DELETE | `/v1/auth/keys/{id}` | 撤銷 API key |
+| GET | `/v1/auth/me/export` | 匯出本帳號的所有資料(privacy.md 承諾的匯出權) |
+| DELETE | `/v1/auth/me?confirm=<email>` | **永久刪除**帳號與所有資料。需帶與帳號相同的 email 作為確認 |
 
 ### 監控
 
