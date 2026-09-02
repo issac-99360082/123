@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 from app import __version__
 from app.config import settings
 from app.db import get_db
-from app.models import Delivery, DeliveryStatus, Monitor
+from app.deps import get_current_user
+from app.models import Delivery, DeliveryStatus, Monitor, User
 
 router = APIRouter(tags=["system"])
 
@@ -42,8 +43,16 @@ def readyz(response: Response, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/metrics")
-def metrics(db: Session = Depends(get_db)) -> dict:
-    """Lightweight operational counters (JSON, not Prometheus - enough for one VPS)."""
+def metrics(
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> dict:
+    """Lightweight operational counters (JSON, not Prometheus - enough for one VPS).
+
+    Authenticated: these counters are business intelligence (how many customers
+    and monitors exist, whether deliveries are failing) and were previously
+    readable by anyone on the internet.
+    """
     now = datetime.now(timezone.utc)
     return {
         "time": now.isoformat(),

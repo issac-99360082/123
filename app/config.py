@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 120
     rate_limit_burst: int = 40
 
+    # Auth endpoints need far tighter limits than the general API: signup is
+    # the door to free resources, and login is a password oracle.
+    signup_limit_per_hour_per_ip: int = 5
+    login_max_failures: int = 8
+    login_lockout_minutes: int = 15
+
     @field_validator("public_base_url")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:

@@ -226,19 +226,20 @@ def fetch(
     respect_robots: bool | None = None,
     throttle: bool = True,
 ) -> FetchResult:
-    """Fetch a URL, returning at most `fetch_max_bytes` of decoded body."""
+    """Fetch a URL, returning at most `fetch_max_bytes` of decoded body.
+
+    Redirects are followed MANUALLY, one hop at a time, and every hop is
+    re-validated. Letting httpx follow redirects automatically would defeat the
+    SSRF guard entirely: an attacker-controlled public host can answer with
+    `302 Location: http://169.254.169.254/`, and only the first URL would ever
+    have been checked.
+    """
     method = (method or "GET").upper()
     if method not in ALLOWED_METHODS:
         raise FetchError("invalid_method", f"Method {method} is not supported.")
 
-    safe_url = validate_target_url(url)
     if respect_robots is None:
         respect_robots = settings.respect_robots_txt
-    if respect_robots and not _robots.allowed(safe_url):
-        raise FetchError("robots_disallowed", "robots.txt on the target site disallows this URL.")
-
-    if throttle:
-        _throttle.wait(urlparse(safe_url).netloc)
 
     request_headers = {
         "User-Agent": settings.user_agent,
@@ -247,42 +248,74 @@ def fetch(
         **sanitize_headers(headers),
     }
 
+    current_url = url
     started = time.perf_counter()
-    try:
-        with httpx.Client(
-            timeout=settings.fetch_timeout_seconds,
-            follow_redirects=True,
-            max_redirects=settings.fetch_max_redirects,
-            headers=request_headers,
-        ) as client:
-            with client.stream(method, safe_url, content=body) as response:
-                chunks: list[bytes] = []
-                total = 0
-                truncated = False
-                for chunk in response.iter_bytes():
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total >= settings.fetch_max_bytes:
-                        truncated = True
-                        break
-                raw = b"".join(chunks)[: settings.fetch_max_bytes]
-                encoding = response.encoding or "utf-8"
-                try:
-                    text = raw.decode(encoding, errors="replace")
-                except (LookupError, UnicodeDecodeError):
-                    text = raw.decode("utf-8", errors="replace")
-                elapsed = (time.perf_counter() - started) * 1000
-                return FetchResult(
-                    url=str(response.url),
-                    status_code=response.status_code,
-                    headers={k.lower(): v for k, v in response.headers.items()},
-                    body=text,
-                    elapsed_ms=elapsed,
-                    truncated=truncated,
+
+    with httpx.Client(
+        timeout=settings.fetch_timeout_seconds,
+        follow_redirects=False,
+        headers=request_headers,
+    ) as client:
+        for hop in range(settings.fetch_max_redirects + 1):
+            # Re-validate on EVERY hop, not just the first.
+            safe_url = validate_target_url(current_url)
+
+            if respect_robots and not _robots.allowed(safe_url):
+                raise FetchError(
+                    "robots_disallowed", "robots.txt on the target site disallows this URL."
                 )
-    except httpx.TimeoutException as exc:
-        raise FetchError("timeout", f"Request timed out after {settings.fetch_timeout_seconds}s") from exc
-    except httpx.TooManyRedirects as exc:
-        raise FetchError("too_many_redirects", str(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise FetchError("network_error", f"{exc.__class__.__name__}: {exc}") from exc
+            if throttle:
+                _throttle.wait(urlparse(safe_url).netloc)
+
+            # Only the first hop carries the body; a redirected request must not
+            # replay a POST body at a different origin.
+            hop_method = method if hop == 0 else ("GET" if method == "POST" else method)
+            hop_body = body if hop == 0 else None
+
+            try:
+                with client.stream(hop_method, safe_url, content=hop_body) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise FetchError(
+                                "invalid_redirect", "Redirect response had no Location header."
+                            )
+                        # Resolve relative redirects against the current URL.
+                        current_url = str(httpx.URL(safe_url).join(location))
+                        continue
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    truncated = False
+                    for chunk in response.iter_bytes():
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= settings.fetch_max_bytes:
+                            truncated = True
+                            break
+                    raw = b"".join(chunks)[: settings.fetch_max_bytes]
+                    encoding = response.encoding or "utf-8"
+                    try:
+                        text = raw.decode(encoding, errors="replace")
+                    except (LookupError, UnicodeDecodeError):
+                        text = raw.decode("utf-8", errors="replace")
+
+                    return FetchResult(
+                        url=safe_url,
+                        status_code=response.status_code,
+                        headers={k.lower(): v for k, v in response.headers.items()},
+                        body=text,
+                        elapsed_ms=(time.perf_counter() - started) * 1000,
+                        truncated=truncated,
+                    )
+            except httpx.TimeoutException as exc:
+                raise FetchError(
+                    "timeout", f"Request timed out after {settings.fetch_timeout_seconds}s"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise FetchError("network_error", f"{exc.__class__.__name__}: {exc}") from exc
+
+    raise FetchError(
+        "too_many_redirects",
+        f"Exceeded {settings.fetch_max_redirects} redirects while fetching.",
+    )

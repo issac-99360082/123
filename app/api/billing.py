@@ -167,51 +167,35 @@ def _apply_subscription(db: Session, user: User, subscription: dict) -> None:
     )
 
 
+def _as_user_id(value: object) -> int | None:
+    """Stripe metadata is free-form text; never let it raise into a 500."""
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        log.warning("stripe_metadata_user_id_invalid", value=str(value)[:64])
+        return None
+
+
 def _find_user(db: Session, obj: dict) -> User | None:
     metadata = obj.get("metadata") or {}
-    if user_id := metadata.get("watchpost_user_id"):
-        if user := db.get(User, int(user_id)):
+    if (user_id := _as_user_id(metadata.get("watchpost_user_id"))) is not None:
+        if user := db.get(User, user_id):
             return user
-    if ref := obj.get("client_reference_id"):
-        if user := db.get(User, int(ref)):
+    if (ref := _as_user_id(obj.get("client_reference_id"))) is not None:
+        if user := db.get(User, ref):
             return user
     if customer_id := obj.get("customer"):
         return db.scalar(select(User).where(User.stripe_customer_id == customer_id))
     return None
 
 
-@router.post("/webhook", response_model=MessageOut)
-async def stripe_webhook(
-    request: Request,
-    db: Session = Depends(get_db),
-    stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
-) -> MessageOut:
-    """Signature-verified, idempotent subscription sync."""
-    if not settings.billing_enabled:
-        raise UpstreamUnavailableError("Billing is not configured on this deployment.")
+class _PermanentEventError(Exception):
+    """The event can never be processed successfully; retrying is pointless."""
 
-    payload = await request.body()
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, stripe_signature, settings.stripe_webhook_secret
-        )
-    except ValueError as exc:
-        raise ValidationFailedError("Malformed Stripe payload.") from exc
-    except stripe.SignatureVerificationError as exc:
-        log.warning("stripe_webhook_bad_signature")
-        raise ValidationFailedError("Stripe signature verification failed.") from exc
 
-    event_id = event["id"]
-    if db.get(StripeEvent, event_id):
-        return MessageOut(message="duplicate event ignored")
-    db.add(StripeEvent(id=event_id, type=event["type"]))
-    db.commit()
-
-    obj = event["data"]["object"]
-    event_type = event["type"]
-
-    stripe.api_key = settings.stripe_secret_key
-
+def _process_event(db: Session, event_type: str, obj: dict) -> None:
+    """Apply one Stripe event. Raises on transient failure so the caller can 500
+    and let Stripe redeliver."""
     if event_type == "checkout.session.completed":
         user = _find_user(db, obj)
         if user and obj.get("subscription"):
@@ -245,6 +229,62 @@ async def stripe_webhook(
 
     else:
         log.debug("stripe_event_ignored", type=event_type)
+
+
+@router.post("/webhook", response_model=MessageOut)
+async def stripe_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+    stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
+) -> MessageOut:
+    """Signature-verified, idempotent subscription sync."""
+    if not settings.billing_enabled:
+        raise UpstreamUnavailableError("Billing is not configured on this deployment.")
+
+    payload = await request.body()
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, stripe_signature, settings.stripe_webhook_secret
+        )
+    except ValueError as exc:
+        raise ValidationFailedError("Malformed Stripe payload.") from exc
+    except stripe.SignatureVerificationError as exc:
+        log.warning("stripe_webhook_bad_signature")
+        raise ValidationFailedError("Stripe signature verification failed.") from exc
+
+    event_id = event["id"]
+    if db.get(StripeEvent, event_id):
+        return MessageOut(message="duplicate event ignored")
+
+    obj = event["data"]["object"]
+    event_type = event["type"]
+    stripe.api_key = settings.stripe_secret_key
+
+    # The event is marked processed ONLY after the work succeeds. Recording it
+    # first (the obvious ordering) loses money: if the Stripe API call below
+    # fails, the customer has paid, the plan was never granted, and Stripe's
+    # redelivery is then discarded as a duplicate.
+    try:
+        _process_event(db, event_type, obj)
+    except stripe.StripeError as exc:
+        db.rollback()
+        log.error(
+            "stripe_event_transient_failure",
+            event_id=event_id, type=event_type, error=str(exc),
+        )
+        # 503 tells Stripe to retry; the event is deliberately NOT recorded.
+        raise UpstreamUnavailableError(
+            "Could not reach Stripe while processing this event; please redeliver."
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        log.exception("stripe_event_processing_failed", event_id=event_id, type=event_type)
+        raise UpstreamUnavailableError(
+            "Event processing failed; please redeliver."
+        ) from exc
+
+    db.add(StripeEvent(id=event_id, type=event_type))
+    db.commit()
 
     return MessageOut(message="ok")
 

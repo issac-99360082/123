@@ -35,6 +35,18 @@ from app.models import User  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def fresh_rate_limits():
+    """Auth throttles are process-global, so reset them between tests exactly
+    as the database is reset - otherwise test order changes test outcomes."""
+    from app import deps
+
+    deps._signup_limiter._events.clear()
+    deps._login_failures._events.clear()
+    deps._limiter._buckets.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def fresh_database():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -175,11 +175,19 @@ def run_check(db: Session, monitor: Monitor, *, notify: bool = True) -> Check:
 def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     """Pick up active monitors that are due, respecting each owner's plan.
 
-    Claiming pushes `next_check_at` forward immediately so a second worker
-    process cannot pick up the same monitor.
+    Claiming is an ATOMIC conditional update:
+
+        UPDATE monitors SET next_check_at = <now + interval>
+        WHERE id = :id AND next_check_at <= :now
+
+    and the monitor is taken only when that statement reports one changed row.
+    A plain read-then-write here is a real bug, not a theoretical one: with four
+    worker processes it was measured handing every due monitor to all four,
+    producing four fetches of the target site, four sets of webhooks, and four
+    times the compute cost per check.
     """
     now = datetime.now(timezone.utc)
-    monitors = db.scalars(
+    candidates = db.scalars(
         select(Monitor)
         .where(Monitor.is_active.is_(True))
         .where(Monitor.next_check_at <= now)
@@ -188,7 +196,7 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     ).all()
 
     claimed: list[Monitor] = []
-    for monitor in monitors:
+    for monitor in candidates:
         user = db.get(User, monitor.user_id)
         if user is None or not user.is_active:
             continue
@@ -200,16 +208,30 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
             )
         )
         if usage and usage.checks_used >= plan.max_checks_per_month:
-            monitor.next_check_at = now + timedelta(hours=6)
+            db.execute(
+                update(Monitor)
+                .where(Monitor.id == monitor.id, Monitor.next_check_at <= now)
+                .values(next_check_at=now + timedelta(hours=6))
+            )
+            db.commit()
             log.info("monitor_skipped_quota", monitor_id=monitor.id, user_id=user.id, plan=plan.key)
             continue
 
         # A downgrade must not leave a monitor running faster than the plan allows.
-        if monitor.interval_seconds < plan.min_interval_seconds:
-            monitor.interval_seconds = plan.min_interval_seconds
+        interval = max(monitor.interval_seconds, plan.min_interval_seconds)
 
-        monitor.next_check_at = now + timedelta(seconds=monitor.interval_seconds)
-        claimed.append(monitor)
+        result = db.execute(
+            update(Monitor)
+            .where(Monitor.id == monitor.id, Monitor.next_check_at <= now)
+            .values(next_check_at=now + timedelta(seconds=interval), interval_seconds=interval)
+        )
+        db.commit()
 
-    db.commit()
+        if result.rowcount == 1:
+            db.refresh(monitor)
+            claimed.append(monitor)
+        else:
+            # Another worker got there first between our SELECT and UPDATE.
+            log.debug("monitor_claim_lost", monitor_id=monitor.id)
+
     return claimed

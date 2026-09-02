@@ -13,13 +13,30 @@ import json
 import re
 import unicodedata
 
+import regex as regex_engine
 from bs4 import BeautifulSoup
 
 from app.models import ExtractMode
 
 MAX_EXTRACT_CHARS = 200_000
 _NON_CONTENT_TAGS = ("script", "style", "noscript", "template", "svg")
-_REGEX_TIMEOUT_GUARD_LEN = 500_000  # refuse to run user regexes over huge inputs
+
+# --- ReDoS containment -----------------------------------------------------
+# Extraction patterns are supplied by users and run on our servers, so a
+# catastrophic-backtracking pattern is a remote CPU denial of service: under
+# stdlib `re`, the pattern "(a+)+$" against 40 characters never returns and
+# pins a worker thread forever.
+#
+# Three layers, because no single one is sufficient:
+#   1. `regex` instead of `re` - it has backtracking protections that defuse
+#      the classic pathological patterns outright.
+#   2. `timeout=` on every user-supplied pattern - a hard wall-clock ceiling
+#      for anything layer 1 does not optimise away.
+#   3. Hard caps on pattern length and input size, so the worst case stays
+#      bounded even if the first two are somehow evaded.
+REGEX_TIMEOUT_SECONDS = 2.0
+MAX_REGEX_INPUT_CHARS = 100_000
+MAX_PATTERN_CHARS = 1_000
 
 
 class ExtractionError(Exception):
@@ -50,18 +67,60 @@ def normalise(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _check_pattern(pattern: str) -> None:
+    if len(pattern) > MAX_PATTERN_CHARS:
+        raise ExtractionError(
+            "pattern_too_long",
+            f"Pattern exceeds {MAX_PATTERN_CHARS} characters.",
+        )
+
+
+def safe_findall(pattern: str, text: str) -> list:
+    """Run a user-supplied pattern under the ReDoS containment described above."""
+    _check_pattern(pattern)
+    text = text[:MAX_REGEX_INPUT_CHARS]
+    try:
+        return regex_engine.findall(
+            pattern,
+            text,
+            flags=regex_engine.MULTILINE | regex_engine.DOTALL,
+            timeout=REGEX_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise ExtractionError(
+            "regex_timeout",
+            f"Pattern took longer than {REGEX_TIMEOUT_SECONDS}s to evaluate. "
+            "Simplify it - nested quantifiers such as (a+)+ are the usual cause.",
+        ) from exc
+    except regex_engine.error as exc:
+        raise ExtractionError("invalid_regex", f"Invalid regex: {exc}") from exc
+
+
+def safe_sub(pattern: str, replacement: str, text: str) -> str:
+    """Substitution counterpart of safe_findall, with the same containment."""
+    _check_pattern(pattern)
+    return regex_engine.sub(
+        pattern,
+        replacement,
+        text[:MAX_REGEX_INPUT_CHARS],
+        flags=regex_engine.MULTILINE,
+        timeout=REGEX_TIMEOUT_SECONDS,
+    )
+
+
 def apply_ignore_patterns(text: str, patterns: list[str] | None) -> str:
     """Blank out volatile substrings (timestamps, nonces, view counters).
 
-    An invalid pattern is skipped rather than failing the whole check - the
-    monitor keeps working and the user sees the pattern had no effect.
+    An invalid, oversized or too-slow pattern is skipped rather than failing the
+    whole check - the monitor keeps working and the user sees the pattern had no
+    effect. A hostile pattern therefore costs at most REGEX_TIMEOUT_SECONDS.
     """
     if not patterns:
         return text
     for pattern in patterns[:20]:
         try:
-            text = re.sub(pattern, "", text, flags=re.MULTILINE)
-        except re.error:
+            text = safe_sub(pattern, "", text)
+        except (regex_engine.error, re.error, TimeoutError, ExtractionError):
             continue
     return normalise(text)
 
@@ -118,12 +177,7 @@ def extract(
     elif mode == ExtractMode.regex.value:
         if not selector:
             raise ExtractionError("missing_selector", "extract_mode 'regex' requires extract_value.")
-        if len(body) > _REGEX_TIMEOUT_GUARD_LEN:
-            body = body[:_REGEX_TIMEOUT_GUARD_LEN]
-        try:
-            matches = re.findall(selector, body, flags=re.MULTILINE | re.DOTALL)
-        except re.error as exc:
-            raise ExtractionError("invalid_regex", f"Invalid regex: {exc}") from exc
+        matches = safe_findall(selector, body)
         if not matches:
             raise ExtractionError("selector_no_match", f"Regex {selector!r} matched nothing.")
         flat = ["".join(m) if isinstance(m, tuple) else str(m) for m in matches]

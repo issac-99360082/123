@@ -131,6 +131,97 @@ class TokenBucket:
 _limiter = TokenBucket(settings.rate_limit_per_minute, settings.rate_limit_burst)
 
 
+class SlidingWindow:
+    """Counts events per key inside a rolling window. Used for signup abuse and
+    failed-login lockout, where a burst allowance would defeat the purpose."""
+
+    def __init__(self, limit: int, window_seconds: int):
+        self.limit = limit
+        self.window = window_seconds
+        self._events: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, key: str, now: float) -> list[float]:
+        hits = [t for t in self._events.get(key, []) if now - t < self.window]
+        self._events[key] = hits
+        return hits
+
+    def check(self, key: str) -> tuple[bool, float]:
+        """Report whether `key` is under the limit, without recording anything."""
+        now = time.monotonic()
+        with self._lock:
+            hits = self._prune(key, now)
+            if len(hits) >= self.limit:
+                return False, self.window - (now - hits[0])
+            return True, 0.0
+
+    def record(self, key: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._prune(key, now).append(now)
+            if len(self._events) > 10_000:
+                self._events = {k: v for k, v in self._events.items() if v}
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._events.pop(key, None)
+
+    def consume(self, key: str) -> tuple[bool, float]:
+        allowed, retry_after = self.check(key)
+        if allowed:
+            self.record(key)
+        return allowed, retry_after
+
+
+_signup_limiter = SlidingWindow(settings.signup_limit_per_hour_per_ip, 3600)
+_login_failures = SlidingWindow(settings.login_max_failures, settings.login_lockout_minutes * 60)
+
+
+def client_ip(request: Request) -> str:
+    """Client address, honouring one layer of reverse proxy.
+
+    Only the first X-Forwarded-For entry is used, and only because the app is
+    documented as running behind a proxy that sets it. Do NOT expose the app
+    directly to the internet with this header trusted.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "anonymous")[:64]
+
+
+def signup_rate_limit(request: Request) -> None:
+    """Throttle account creation per IP.
+
+    Without this, one host can mint unlimited free accounts and with them
+    unlimited free monitors - the service pays for every one of those checks.
+    """
+    allowed, retry_after = _signup_limiter.consume(f"signup:{client_ip(request)}")
+    if not allowed:
+        raise RateLimitError(
+            f"Only {settings.signup_limit_per_hour_per_ip} accounts may be created per hour "
+            "from one address.",
+            detail={"retry_after_seconds": round(retry_after, 1)},
+        )
+
+
+def check_login_lockout(email: str) -> None:
+    allowed, retry_after = _login_failures.check(f"login:{email.lower()}")
+    if not allowed:
+        raise RateLimitError(
+            "Too many failed sign-in attempts for this account. Try again later.",
+            detail={"retry_after_seconds": round(retry_after, 1)},
+        )
+
+
+def record_login_failure(email: str) -> None:
+    _login_failures.record(f"login:{email.lower()}")
+
+
+def clear_login_failures(email: str) -> None:
+    _login_failures.reset(f"login:{email.lower()}")
+
+
 def rate_limit(request: Request) -> None:
     key = _extract_key(request) or (request.client.host if request.client else "anonymous")
     allowed, retry_after = _limiter.consume(key[:64])

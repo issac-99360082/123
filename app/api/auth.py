@@ -14,7 +14,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import get_current_user, rate_limit
+from app.deps import (
+    check_login_lockout,
+    clear_login_failures,
+    get_current_user,
+    rate_limit,
+    record_login_failure,
+    signup_rate_limit,
+)
 from app.errors import AppError, AuthError, NotFoundError
 from app.logging_conf import get_logger
 from app.models import ApiKey, User
@@ -45,12 +52,22 @@ def _issue_key(db: Session, user: User, name: str) -> tuple[ApiKey, str]:
     return api_key, plaintext
 
 
-@router.post("/signup", response_model=ApiKeyCreatedOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/signup",
+    response_model=ApiKeyCreatedOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(signup_rate_limit)],
+)
 def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> ApiKeyCreatedOut:
     """Create an account and return its first API key. Self-serve, no human in the loop."""
     email = payload.email.lower().strip()
     if db.scalar(select(User).where(User.email == email)):
-        raise AppError("An account with that email already exists.")
+        # Deliberately vague. NOTE: this only narrows the enumeration oracle,
+        # it does not close it - the status code still differs from a successful
+        # signup. Closing it fully requires an email-verification flow that
+        # returns an identical 202 in both cases, which needs SMTP configured.
+        # Tracked in docs/SECURITY.md.
+        raise AppError("Unable to create an account with those details.")
 
     user = User(email=email, password_hash=hash_password(payload.password), plan=DEFAULT_PLAN)
     db.add(user)
@@ -66,13 +83,23 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> ApiKeyCreat
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> ApiKeyCreatedOut:
     """Exchange email + password for a fresh API key."""
     email = payload.email.lower().strip()
+
+    # Lock the account out after repeated failures, independently of the shared
+    # per-IP limit: a distributed guesser rotates addresses, so an IP-only limit
+    # is not a password-guessing control.
+    check_login_lockout(email)
+
     user = db.scalar(select(User).where(User.email == email))
     # Same error and roughly the same work either way, so the response does not
     # reveal whether the email exists.
     if user is None or not verify_password(payload.password, user.password_hash):
+        record_login_failure(email)
         raise AuthError("Invalid email or password.")
     if not user.is_active:
-        raise AuthError("Account is disabled.")
+        record_login_failure(email)
+        raise AuthError("Invalid email or password.")
+
+    clear_login_failures(email)
 
     active = db.scalars(
         select(ApiKey).where(ApiKey.user_id == user.id, ApiKey.revoked_at.is_(None))
