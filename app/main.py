@@ -150,19 +150,20 @@ def create_app() -> FastAPI:
             },
         )
 
+    def _billing_result(request: Request, ok: bool):
+        return templates.TemplateResponse(
+            request=request,
+            name="billing_result.html",
+            context={"ok": ok, "base_url": settings.public_base_url},
+        )
+
     @app.get("/billing/success", response_class=HTMLResponse, include_in_schema=False)
     def billing_success(request: Request):
-        return templates.TemplateResponse(
-            request=request, name="billing_result.html",
-            context={"ok": True, "base_url": settings.public_base_url},
-        )
+        return _billing_result(request, ok=True)
 
     @app.get("/billing/cancelled", response_class=HTMLResponse, include_in_schema=False)
     def billing_cancelled(request: Request):
-        return templates.TemplateResponse(
-            request=request, name="billing_result.html",
-            context={"ok": False, "base_url": settings.public_base_url},
-        )
+        return _billing_result(request, ok=False)
 
     return app
 

@@ -177,20 +177,15 @@ def _as_user_id(value: object) -> int | None:
 
 
 def _find_user(db: Session, obj: dict) -> User | None:
+    """Resolve the account an event belongs to, most reliable identifier first."""
     metadata = obj.get("metadata") or {}
-    if (user_id := _as_user_id(metadata.get("watchpost_user_id"))) is not None:
-        if user := db.get(User, user_id):
-            return user
-    if (ref := _as_user_id(obj.get("client_reference_id"))) is not None:
-        if user := db.get(User, ref):
+    for candidate in (metadata.get("watchpost_user_id"), obj.get("client_reference_id")):
+        user_id = _as_user_id(candidate)
+        if user_id is not None and (user := db.get(User, user_id)):
             return user
     if customer_id := obj.get("customer"):
         return db.scalar(select(User).where(User.stripe_customer_id == customer_id))
     return None
-
-
-class _PermanentEventError(Exception):
-    """The event can never be processed successfully; retrying is pointless."""
 
 
 def _is_stale(user: User, event_created: int | None) -> bool:
@@ -207,62 +202,72 @@ def _is_stale(user: User, event_created: int | None) -> bool:
 
 
 def _mark_applied(db: Session, user: User, event_created: int | None) -> None:
-    if event_created is not None:
-        if user.last_stripe_event_at is None or event_created > user.last_stripe_event_at:
-            user.last_stripe_event_at = event_created
-            db.commit()
+    if event_created is not None and (
+        user.last_stripe_event_at is None or event_created > user.last_stripe_event_at
+    ):
+        user.last_stripe_event_at = event_created
+        db.commit()
+
+
+SUBSCRIPTION_EVENTS = {
+    "customer.subscription.created",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
+}
+HANDLED_EVENTS = SUBSCRIPTION_EVENTS | {
+    "checkout.session.completed",
+    "invoice.payment_failed",
+}
 
 
 def _process_event(
     db: Session, event_type: str, obj: dict, event_created: int | None = None
 ) -> None:
     """Apply one Stripe event. Raises on transient failure so the caller can 503
-    and let Stripe redeliver."""
-    if event_type == "checkout.session.completed":
-        user = _find_user(db, obj)
-        if user and _is_stale(user, event_created):
-            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
-            return
-        if user and obj.get("subscription"):
-            if not user.stripe_customer_id and obj.get("customer"):
-                user.stripe_customer_id = obj["customer"]
-            subscription = stripe.Subscription.retrieve(obj["subscription"])
-            _apply_subscription(db, user, dict(subscription))
-            _mark_applied(db, user, event_created)
+    and let Stripe redeliver.
 
-    elif event_type in {
-        "customer.subscription.created",
-        "customer.subscription.updated",
-        "customer.subscription.deleted",
-    }:
-        user = _find_user(db, obj)
-        if user and _is_stale(user, event_created):
-            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
-            return
-        if user:
-            if event_type == "customer.subscription.deleted":
-                user.plan = Plan.free.value
-                user.subscription_status = "canceled"
-                user.stripe_subscription_id = None
-                db.commit()
-                log.info("subscription_cancelled", user_id=user.id)
-            else:
-                _apply_subscription(db, user, dict(obj))
-            _mark_applied(db, user, event_created)
-
-    elif event_type == "invoice.payment_failed":
-        user = _find_user(db, obj)
-        if user and _is_stale(user, event_created):
-            log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
-            return
-        if user:
-            user.subscription_status = "past_due"
-            db.commit()
-            _mark_applied(db, user, event_created)
-            log.warning("invoice_payment_failed", user_id=user.id)
-
-    else:
+    Resolving the account and rejecting out-of-order events happens ONCE, here,
+    rather than inside each branch. That is deliberate: the staleness check is
+    what stops a late `subscription.updated` from re-upgrading a cancelled
+    account, and a branch that forgets it silently gives away paid features. Do
+    the check in the dispatcher and a new branch cannot forget it.
+    """
+    if event_type not in HANDLED_EVENTS:
         log.debug("stripe_event_ignored", type=event_type)
+        return
+
+    user = _find_user(db, obj)
+    if user is None:
+        log.info("stripe_event_no_matching_user", type=event_type)
+        return
+    if _is_stale(user, event_created):
+        log.info("stripe_event_stale_ignored", type=event_type, user_id=user.id)
+        return
+
+    if event_type == "checkout.session.completed":
+        if not obj.get("subscription"):
+            return
+        if not user.stripe_customer_id and obj.get("customer"):
+            user.stripe_customer_id = obj["customer"]
+        subscription = stripe.Subscription.retrieve(obj["subscription"])
+        _apply_subscription(db, user, dict(subscription))
+
+    elif event_type == "customer.subscription.deleted":
+        user.plan = Plan.free.value
+        user.subscription_status = "canceled"
+        user.stripe_subscription_id = None
+        db.commit()
+        log.info("subscription_cancelled", user_id=user.id)
+
+    elif event_type in SUBSCRIPTION_EVENTS:
+        _apply_subscription(db, user, dict(obj))
+
+    else:  # invoice.payment_failed
+        user.subscription_status = "past_due"
+        db.commit()
+        log.warning("invoice_payment_failed", user_id=user.id)
+
+    _mark_applied(db, user, event_created)
 
 
 @router.post("/webhook", response_model=MessageOut)

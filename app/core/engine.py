@@ -253,16 +253,20 @@ def run_check(db: Session, monitor: Monitor, *, notify: bool = True) -> Check:
 def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     """Pick up active monitors that are due, respecting each owner's plan.
 
-    Claiming is an ATOMIC conditional update:
+    Claiming is an ATOMIC conditional update that takes a SHORT LEASE:
 
-        UPDATE monitors SET next_check_at = <now + interval>
+        UPDATE monitors SET next_check_at = <now + lease>
         WHERE id = :id AND next_check_at <= :now
 
     and the monitor is taken only when that statement reports one changed row.
-    A plain read-then-write here is a real bug, not a theoretical one: with four
-    worker processes it was measured handing every due monitor to all four,
-    producing four fetches of the target site, four sets of webhooks, and four
-    times the compute cost per check.
+    Two measured failures shaped this:
+
+    * A plain read-then-write handed every due monitor to all four workers,
+      producing four fetches, four sets of webhooks and four times the cost.
+    * Advancing by the full interval instead of a lease meant a worker that died
+      mid-check silently skipped that cycle - a daily monitor lost a whole day
+      with no check row and no error. run_check() sets the real next_check_at
+      when it finishes; if it never runs, the lease expires and work is retried.
     """
     now = datetime.now(timezone.utc)
 
@@ -282,12 +286,12 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     # one account cannot displace another account's work before we ever see it.
     # Fetch a little more than each account's fair share, so the second pass has
     # material to top the batch up with once every account has been served.
-    per_user_cap_rows = max(1, int(limit * settings.max_batch_share_per_user))
-    per_user_fetch = min(
-        limit, max(per_user_cap_rows * 2, -(-limit // len(due_user_ids)) + 1)
+    per_user_cap = max(1, int(limit * settings.max_batch_share_per_user))
+    per_user_fetch = (
+        limit
+        if len(due_user_ids) == 1
+        else min(limit, max(per_user_cap * 2, -(-limit // len(due_user_ids)) + 1))
     )
-    if len(due_user_ids) == 1:
-        per_user_fetch = limit
 
     by_user: dict[int, list[Monitor]] = {}
     for user_id in due_user_ids:
@@ -305,18 +309,12 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     claimed: list[Monitor] = []
     taken_per_user: dict[int, int] = {}
 
-    # Fairness cap: ORDER BY next_check_at alone lets one account whose monitors
-    # are all due fill the entire batch. Measured with 45 hanging monitors from
-    # one user, a tick took 125s at production timeouts, leaving a second user's
-    # 60s-interval monitors permanently late.
-    #
     # Two passes, so fairness costs nothing when there is no contention:
-    #   pass 1 honours the per-user cap;
-    #   pass 2 fills any slots still free, ignoring the cap.
-    # With one active user the batch still fills completely; with many, no
-    # single user can crowd the others out.
-    per_user_cap = max(1, int(limit * settings.max_batch_share_per_user))
-
+    # pass 1 honours per_user_cap; pass 2 fills any slots still free, ignoring
+    # it. One active user still fills the batch; many users cannot be crowded
+    # out by one. Measured before this: 45 hanging monitors from a single user
+    # took a tick to 125s at production timeouts, leaving another user's
+    # 60s-interval monitors permanently late.
     def _try_claim(monitor: Monitor, cap: int | None) -> bool:
         if cap is not None and taken_per_user.get(monitor.user_id, 0) >= cap:
             return False

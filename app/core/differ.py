@@ -31,9 +31,9 @@ def build_diff(old: str | None, new: str) -> dict:
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "insert":
-            added.extend(_clip(l) for l in new_lines[j1:j2])
+            added.extend(_clip(line) for line in new_lines[j1:j2])
         elif tag == "delete":
-            removed.extend(_clip(l) for l in old_lines[i1:i2])
+            removed.extend(_clip(line) for line in old_lines[i1:i2])
         elif tag == "replace":
             old_block = old_lines[i1:i2]
             new_block = new_lines[j1:j2]

@@ -50,6 +50,16 @@ def _get_owned_monitor(db: Session, user: User, monitor_id: int) -> Monitor:
     return monitor
 
 
+def _history_cutoff(db: Session, user: User, monitor_id: int) -> datetime:
+    """Verify ownership and return the oldest timestamp this plan may read.
+
+    History endpoints must not become a way to read another account's data, so
+    ownership is checked here rather than being left to each caller.
+    """
+    _get_owned_monitor(db, user, monitor_id)
+    return datetime.now(timezone.utc) - timedelta(days=get_plan(user.plan).history_days)
+
+
 def _validate_monitor_urls(url: str | None, webhook_url: str | None) -> None:
     """Reject unsafe URLs at write time, so the user finds out immediately.
 
@@ -218,9 +228,7 @@ def list_checks(
     db: Session = Depends(get_db),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[CheckOut]:
-    _get_owned_monitor(db, user, monitor_id)
-    plan = get_plan(user.plan)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=plan.history_days)
+    cutoff = _history_cutoff(db, user, monitor_id)
     checks = db.scalars(
         select(Check)
         .where(Check.monitor_id == monitor_id, Check.started_at >= cutoff)
@@ -237,9 +245,7 @@ def list_changes(
     db: Session = Depends(get_db),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[ChangeEventOut]:
-    _get_owned_monitor(db, user, monitor_id)
-    plan = get_plan(user.plan)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=plan.history_days)
+    cutoff = _history_cutoff(db, user, monitor_id)
     events = db.scalars(
         select(ChangeEvent)
         .where(ChangeEvent.monitor_id == monitor_id, ChangeEvent.created_at >= cutoff)

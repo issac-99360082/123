@@ -215,12 +215,22 @@ def signup_rate_limit(request: Request) -> None:
         )
 
 
-def check_login_lockout(email: str, source: str) -> None:
+def _login_limiters(email: str, source: str) -> tuple[tuple[SlidingWindow, str], ...]:
+    """The two tiers guarding sign-in, tightest first.
+
+    Tier 1 is per (account, source) - the shape of a real guessing attack.
+    Tier 2 is per account across all sources, set much looser: a lock that trips
+    on the account alone lets anyone who knows an email deny its owner access.
+    """
     email = email.lower()
-    for limiter, key in (
+    return (
         (_login_failures, f"login:{email}:{source}"),
         (_login_failures_global, f"login:{email}"),
-    ):
+    )
+
+
+def check_login_lockout(email: str, source: str) -> None:
+    for limiter, key in _login_limiters(email, source):
         allowed, retry_after = limiter.check(key)
         if not allowed:
             raise RateLimitError(
@@ -230,15 +240,13 @@ def check_login_lockout(email: str, source: str) -> None:
 
 
 def record_login_failure(email: str, source: str) -> None:
-    email = email.lower()
-    _login_failures.record(f"login:{email}:{source}")
-    _login_failures_global.record(f"login:{email}")
+    for limiter, key in _login_limiters(email, source):
+        limiter.record(key)
 
 
 def clear_login_failures(email: str, source: str) -> None:
-    email = email.lower()
-    _login_failures.reset(f"login:{email}:{source}")
-    _login_failures_global.reset(f"login:{email}")
+    for limiter, key in _login_limiters(email, source):
+        limiter.reset(key)
 
 
 def rate_limit(request: Request) -> None:
