@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Verify the app imports and the schema builds
+        run: |
+          python -c "
+          from app.main import app
+          from app.db import init_db
+          init_db()
+          spec = app.openapi()
+          print(f'{len(spec[\"paths\"])} API paths')
+          "
+        env:
+          DATABASE_URL: sqlite:///./ci.db
+          SCHEDULER_ENABLED: "false"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t watchpost:ci .
+      - name: Boot the container and check /healthz
+        run: |
+          docker run -d --name wp -p 8000:8000 \
+            -e SCHEDULER_ENABLED=false \
+            -e DATABASE_URL=sqlite:////tmp/ci.db \
+            watchpost:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/healthz && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/healthz
+          docker rm -f wp

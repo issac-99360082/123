@@ -1,0 +1,50 @@
+# Production-shaped local stack: Postgres, an API process, and a separate
+# worker that owns the check loop.
+#
+#   cp .env.example .env && docker compose up --build
+#
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: watchpost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-watchpost}
+      POSTGRES_DB: watchpost
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchpost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://watchpost:${POSTGRES_PASSWORD:-watchpost}@db:5432/watchpost
+      # The worker owns the schedule; the API must not also run it, or every
+      # monitor would be checked twice.
+      SCHEDULER_ENABLED: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://watchpost:${POSTGRES_PASSWORD:-watchpost}@db:5432/watchpost
+      SCHEDULER_ENABLED: "true"
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

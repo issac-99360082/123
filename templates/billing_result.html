@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% if ok %}Subscription active{% else %}Checkout cancelled{% endif %} — Watchpost</title>
+<style>
+  body{margin:0;background:#0f1115;color:#e6e9ef;font:16px/1.6 ui-sans-serif,system-ui,sans-serif;
+       display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
+  .box{max-width:520px;padding:40px 28px}
+  h1{font-size:1.8rem;margin:0 0 12px}
+  p{color:#98a1b3}
+  a{color:#5b9cff}
+</style>
+</head>
+<body>
+  <div class="box">
+    {% if ok %}
+      <h1>Payment received</h1>
+      <p>Your subscription is being activated. Plan limits update as soon as Stripe confirms
+         the payment — usually within a few seconds.</p>
+      <p>Check with <code>GET /v1/billing/subscription</code>.</p>
+    {% else %}
+      <h1>Checkout cancelled</h1>
+      <p>Nothing was charged. Your account is unchanged and still on its current plan.</p>
+    {% endif %}
+    <p><a href="{{ base_url }}/">Back to Watchpost</a></p>
+  </div>
+</body>
+</html>
