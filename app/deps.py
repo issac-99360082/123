@@ -250,11 +250,10 @@ def clear_login_failures(email: str, source: str) -> None:
 
 
 def rate_limit(request: Request) -> None:
-    # Authenticated callers are keyed on their API key. Anonymous callers fall
-    # back to their address via client_ip(), which respects TRUST_PROXY_HEADERS:
-    # using request.client.host directly would put every anonymous request
-    # behind a reverse proxy into ONE bucket, so a single abuser could stop all
-    # new signups for everybody.
+    # Authenticated callers key on their API key; anonymous ones on client_ip(),
+    # which respects TRUST_PROXY_HEADERS. Using request.client.host directly
+    # would put all anonymous traffic behind a proxy into ONE bucket, letting a
+    # single abuser stop every new signup.
     key = _extract_key(request) or client_ip(request)
     allowed, retry_after = _limiter.consume(key[:64])
     if not allowed:

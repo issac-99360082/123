@@ -6,79 +6,13 @@ so this exercises fetch -> extract -> diff -> queue -> deliver as one system.
 
 from __future__ import annotations
 
-import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
 
-import pytest
-
-from app.config import settings
 from app.core.scheduler import tick
-from app.models import ChangeEvent, Delivery, DeliveryStatus, Monitor, User
+from app.models import ChangeEvent, Delivery, DeliveryStatus, Monitor
 from app.security import sign_webhook
 
-# State shared with the handler threads.
-PAGE_PRICE = {"value": "$19.00"}
-RECEIVED: list[dict] = []
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # silence per-request stderr noise
-        pass
-
-    def do_GET(self):
-        if self.path == "/pricing":
-            body = (
-                f'<html><body><h1>Widget</h1>'
-                f'<div class="price">{PAGE_PRICE["value"]}</div></body></html>'
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/robots.txt":
-            self.send_response(404)
-            self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        RECEIVED.append(
-            {
-                "headers": {k.lower(): v for k, v in self.headers.items()},
-                "raw": raw,
-                "json": json.loads(raw.decode()),
-            }
-        )
-        self.send_response(200)
-        self.end_headers()
-
-
-@pytest.fixture
-def server():
-    PAGE_PRICE["value"] = "$19.00"
-    RECEIVED.clear()
-    httpd = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-
-@pytest.fixture
-def allow_localhost(monkeypatch):
-    """The SSRF guard is doing its job; the test server is deliberately local."""
-    monkeypatch.setattr(settings, "allow_private_network_targets", True)
-
-
-def test_full_lifecycle_signup_to_signed_webhook(client, db, server, allow_localhost):
+def test_full_lifecycle_signup_to_signed_webhook(client, db, site):
     # 1. Self-serve signup - no human in the loop.
     signup = client.post(
         "/v1/auth/signup", json={"email": "e2e@example.com", "password": "correct-horse-42"}
@@ -89,7 +23,7 @@ def test_full_lifecycle_signup_to_signed_webhook(client, db, server, allow_local
     # 2. Preview the extraction before committing to a monitor.
     preview = client.post(
         "/v1/preview",
-        json={"url": f"{server}/pricing", "extract_mode": "css", "extract_value": ".price"},
+        json={"url": f"{site.url}/", "extract_mode": "css", "extract_value": ".price"},
         headers=headers,
     )
     assert preview.status_code == 200, preview.text
@@ -100,11 +34,11 @@ def test_full_lifecycle_signup_to_signed_webhook(client, db, server, allow_local
         "/v1/monitors",
         json={
             "name": "E2E price",
-            "url": f"{server}/pricing",
+            "url": f"{site.url}/",
             "extract_mode": "css",
             "extract_value": ".price",
             "interval_seconds": 3600,
-            "notify_webhook_url": f"{server}/hook",
+            "notify_webhook_url": f"{site.url}/hook",
         },
         headers=headers,
     )
@@ -115,23 +49,23 @@ def test_full_lifecycle_signup_to_signed_webhook(client, db, server, allow_local
     # 4. First tick records the baseline and must NOT notify.
     result = tick()
     assert result["monitors_checked"] == 1
-    assert RECEIVED == [], "a first observation is not a change"
+    assert site.received == [], "a first observation is not a change"
 
     # 5. Nothing changed upstream -> still silent.
-    db.query(Monitor).filter(Monitor.id == monitor_id).update({"next_check_at": _now()})
+    db.query(Monitor).filter(Monitor.id == monitor_id).update({"next_check_at": datetime.now(timezone.utc)})
     db.commit()
     tick()
-    assert RECEIVED == []
+    assert site.received == []
 
     # 6. The page changes -> exactly one signed webhook arrives.
-    PAGE_PRICE["value"] = "$17.50"
-    db.query(Monitor).filter(Monitor.id == monitor_id).update({"next_check_at": _now()})
+    site.price = "$17.50"
+    db.query(Monitor).filter(Monitor.id == monitor_id).update({"next_check_at": datetime.now(timezone.utc)})
     db.commit()
     tick()
 
-    assert len(RECEIVED) == 1, "a real change must notify exactly once"
-    delivered = RECEIVED[0]
-    payload = delivered["json"]
+    assert len(site.received) == 1, "a real change must notify exactly once"
+    delivered = site.received[0]
+    payload = site.json_payloads()[0]
     assert payload["event"] == "monitor.changed"
     assert payload["monitor"]["id"] == monitor_id
     assert payload["change"]["modified"] == [{"before": "$19.00", "after": "$17.50"}]
@@ -155,7 +89,7 @@ def test_full_lifecycle_signup_to_signed_webhook(client, db, server, allow_local
     assert usage["checks_used"] == 3 and usage["changes_detected"] == 1
 
 
-def test_manual_run_endpoint_detects_a_change(client, db, server, allow_localhost):
+def test_manual_run_endpoint_detects_a_change(client, db, site):
     signup = client.post(
         "/v1/auth/signup", json={"email": "manual@example.com", "password": "correct-horse-42"}
     )
@@ -164,24 +98,24 @@ def test_manual_run_endpoint_detects_a_change(client, db, server, allow_localhos
         "/v1/monitors",
         json={
             "name": "manual",
-            "url": f"{server}/pricing",
+            "url": f"{site.url}/",
             "extract_mode": "css",
             "extract_value": ".price",
             "interval_seconds": 3600,
-            "notify_webhook_url": f"{server}/hook",
+            "notify_webhook_url": f"{site.url}/hook",
         },
         headers=headers,
     ).json()
 
     assert client.post(f"/v1/monitors/{created['id']}/run", headers=headers).json()["status"] == "unchanged"
 
-    PAGE_PRICE["value"] = "$12.00"
+    site.price = "$12.00"
     second = client.post(f"/v1/monitors/{created['id']}/run", headers=headers).json()
     assert second["status"] == "changed"
     assert db.query(ChangeEvent).count() == 1
 
 
-def test_unreachable_target_is_recorded_as_an_error(client, db, server, allow_localhost):
+def test_unreachable_target_is_recorded_as_an_error(client, db, site):
     signup = client.post(
         "/v1/auth/signup", json={"email": "err@example.com", "password": "correct-horse-42"}
     )
@@ -190,10 +124,10 @@ def test_unreachable_target_is_recorded_as_an_error(client, db, server, allow_lo
         "/v1/monitors",
         json={
             "name": "missing page",
-            "url": f"{server}/does-not-exist",
+            "url": f"{site.url}/404",
             "extract_mode": "text",
             "interval_seconds": 3600,
-            "notify_webhook_url": f"{server}/hook",
+            "notify_webhook_url": f"{site.url}/hook",
         },
         headers=headers,
     ).json()
@@ -202,10 +136,4 @@ def test_unreachable_target_is_recorded_as_an_error(client, db, server, allow_lo
     assert check["status"] == "error"
     assert check["error_type"] == "http_error"
     assert check["http_status"] == 404
-    assert RECEIVED == [], "errors must not fire change notifications"
-
-
-def _now():
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc)
+    assert site.received == [], "errors must not fire change notifications"

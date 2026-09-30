@@ -321,12 +321,10 @@ def fetch(
                     total = 0
                     truncated = False
                     for chunk in response.iter_bytes():
-                        # The deadline must be enforced DURING the body read, not
-                        # only between redirect hops. httpx timeouts are per
-                        # socket operation, so a server that trickles one small
-                        # chunk just under the timeout, forever, never trips them:
-                        # measured holding a worker thread for 60s against a 12s
-                        # deadline. That is a slow-loris against our own pool.
+                        # Enforced DURING the body read, not only between hops:
+                        # httpx timeouts are per socket operation, so a server
+                        # trickling one small chunk forever never trips them.
+                        # That is a slow-loris against our own worker pool.
                         if time.perf_counter() >= deadline:
                             raise FetchError("deadline_exceeded", _DEADLINE_MESSAGE)
                         chunks.append(chunk)
@@ -354,10 +352,8 @@ def fetch(
                     "timeout", f"Request timed out after {settings.fetch_timeout_seconds}s"
                 ) from exc
             except httpx.HTTPError as exc:
-                # Distinguish the common failures. Collapsing them all into
-                # "network_error" leaves a user unable to tell an expired
-                # certificate from a dead DNS record from a refused port, which
-                # are three completely different things to go and fix.
+                # Distinguish the common failures: an expired certificate, a
+                # dead DNS record and a refused port need different fixes.
                 raise FetchError(_classify_http_error(exc), f"{exc.__class__.__name__}: {exc}") from exc
 
     raise FetchError(

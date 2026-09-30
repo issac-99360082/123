@@ -174,16 +174,11 @@ def run_check(db: Session, monitor: Monitor, *, notify: bool = True) -> Check:
         log.info("check_error", monitor_id=monitor.id, error_type=error_kind, message=error_message)
         return check
 
-    # --- transient-blank guard --------------------------------------------
-    # An HTTP 200 with a body that extracts to nothing is far more often a site
-    # mid-deploy, an interstitial, or a soft error page than a real edit. Taking
-    # it at face value produces two false alerts per blip - one when the content
-    # "disappears" and another when it "comes back". Measured: two blips of a
-    # stable page produced four webhook notifications, none of them real.
-    #
-    # So an empty extraction that replaces non-empty content must be CONFIRMED by
-    # consecutive observations before it is believed. A page that genuinely
-    # empties still reports, just one interval later.
+    # Transient-blank guard. An HTTP 200 that extracts to nothing is far more
+    # often a site mid-deploy or a soft error page than a real edit, and taking
+    # it at face value fires two false alerts per blip. So empty content
+    # replacing non-empty must be confirmed by consecutive observations; a page
+    # that genuinely empties still reports, one interval later.
     if not new_content and monitor.last_content:
         confirmations = _recent_empty_streak(db, monitor.id) + 1
         if confirmations < settings.empty_content_confirmations:
@@ -270,7 +265,7 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     """
     now = datetime.now(timezone.utc)
 
-    # Which accounts have work waiting. Cheap, and bounded per tick.
+    # Which accounts have work waiting - cheap, and bounded per tick.
     due_user_ids = db.scalars(
         select(Monitor.user_id)
         .where(Monitor.is_active.is_(True))
@@ -282,10 +277,10 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     if not due_user_ids:
         return []
 
-    # Pull each account's oldest-due monitors SEPARATELY, so a large backlog on
-    # one account cannot displace another account's work before we ever see it.
-    # Fetch a little more than each account's fair share, so the second pass has
-    # material to top the batch up with once every account has been served.
+    # Pull each account's oldest-due monitors SEPARATELY: a single global
+    # "ORDER BY next_check_at LIMIT n" is filled outright by one account with a
+    # large backlog, and no downstream fairness logic can recover from that.
+    # Fetch slightly above each fair share so pass 2 has material to top up with.
     per_user_cap = max(1, int(limit * settings.max_batch_share_per_user))
     per_user_fetch = (
         limit
@@ -309,12 +304,9 @@ def claim_due_monitors(db: Session, limit: int) -> list[Monitor]:
     claimed: list[Monitor] = []
     taken_per_user: dict[int, int] = {}
 
-    # Two passes, so fairness costs nothing when there is no contention:
-    # pass 1 honours per_user_cap; pass 2 fills any slots still free, ignoring
-    # it. One active user still fills the batch; many users cannot be crowded
-    # out by one. Measured before this: 45 hanging monitors from a single user
-    # took a tick to 125s at production timeouts, leaving another user's
-    # 60s-interval monitors permanently late.
+    # Two passes, so fairness costs nothing without contention: pass 1 honours
+    # per_user_cap, pass 2 fills remaining slots ignoring it. One user still
+    # fills the batch; many cannot be crowded out by one.
     def _try_claim(monitor: Monitor, cap: int | None) -> bool:
         if cap is not None and taken_per_user.get(monitor.user_id, 0) >= cap:
             return False

@@ -8,11 +8,8 @@ wrong", not "does the happy path work".
 
 from __future__ import annotations
 
-import gzip
-import threading
 import time
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -21,71 +18,6 @@ from app.core.engine import claim_due_monitors, run_check
 from app.core.fetcher import FetchError, fetch
 from app.models import ChangeEvent, CheckStatus, Delivery, Monitor, User
 from app.security import hash_password
-
-BOMB = gzip.compress(b"A" * (50 * 1024 * 1024))
-PAGE = b'<html><body><div class="price">$19.00</div></body></html>'
-
-
-class _Faults(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *a):
-        pass
-
-    def _send(self, code, body=b"", extra=None):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
-
-    def do_GET(self):
-        try:
-            if self.path.startswith("/slow"):
-                # Trickle: every chunk arrives well inside the socket timeout,
-                # so only a total deadline can stop this.
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                for _ in range(120):
-                    chunk = b"<div>x</div>"
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                    self.wfile.flush()
-                    time.sleep(0.4)
-                self.wfile.write(b"0\r\n\r\n")
-            elif self.path.startswith("/bomb"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.send_header("Content-Encoding", "gzip")
-                self.send_header("Content-Length", str(len(BOMB)))
-                self.end_headers()
-                self.wfile.write(BOMB)
-            elif self.path.startswith("/empty"):
-                self._send(200, b"")
-            elif self.path.startswith("/500"):
-                self._send(500, b"err")
-            else:
-                self._send(200, PAGE)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-
-
-@pytest.fixture
-def fault_site(monkeypatch):
-    monkeypatch.setattr(settings, "allow_private_network_targets", True)
-    monkeypatch.setattr(settings, "min_seconds_between_hits_per_host", 0)
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Faults)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
 
 @pytest.fixture
 def owner(db) -> User:
@@ -120,7 +52,7 @@ def make_monitor(db, user, url, **kw) -> Monitor:
 # CRITICAL - slow-loris: the deadline must apply while the body streams
 # ---------------------------------------------------------------------------
 
-def test_trickling_site_cannot_hold_a_worker_past_the_deadline(fault_site, monkeypatch):
+def test_trickling_site_cannot_hold_a_worker_past_the_deadline(site, monkeypatch):
     """Measured before the fix: 60s against a 12s deadline. httpx timeouts are
     per socket operation, so a server that sends one small chunk just inside the
     timeout, forever, never trips them."""
@@ -129,16 +61,16 @@ def test_trickling_site_cannot_hold_a_worker_past_the_deadline(fault_site, monke
 
     started = time.perf_counter()
     with pytest.raises(FetchError) as exc:
-        fetch(f"{fault_site}/slow", respect_robots=False, throttle=False)
+        fetch(f"{site.url}/slow", respect_robots=False, throttle=False)
     elapsed = time.perf_counter() - started
 
     assert exc.value.kind == "deadline_exceeded"
     assert elapsed < 8.0, f"a trickling site held the worker for {elapsed:.1f}s"
 
 
-def test_decompression_bomb_stays_bounded(fault_site, monkeypatch):
+def test_decompression_bomb_stays_bounded(site, monkeypatch):
     monkeypatch.setattr(settings, "fetch_total_deadline_seconds", 30.0)
-    result = fetch(f"{fault_site}/bomb", respect_robots=False, throttle=False)
+    result = fetch(f"{site.url}/bomb", respect_robots=False, throttle=False)
     assert result.truncated is True
     assert len(result.body) <= settings.fetch_max_bytes
 
@@ -150,10 +82,10 @@ def test_dns_failure_is_classified(monkeypatch):
     assert exc.value.kind == "dns_error"
 
 
-def test_tls_failure_is_classified(fault_site):
+def test_tls_failure_is_classified(site):
     """HTTPS pointed at a plain-HTTP listener: a handshake failure, not a
     refused connection. These used to collapse into one opaque 'network_error'."""
-    https_url = fault_site.replace("http://", "https://")
+    https_url = site.url.replace("http://", "https://")
     with pytest.raises(FetchError) as exc:
         fetch(https_url, respect_robots=False, throttle=False)
     assert exc.value.kind == "tls_error"
@@ -200,9 +132,9 @@ def test_claim_is_a_short_lease_not_a_full_reschedule(db, owner):
     assert [m.id for m in claim_due_monitors(db, 10)] == [monitor.id]
 
 
-def test_completed_check_reschedules_at_the_full_interval(db, owner, fault_site):
+def test_completed_check_reschedules_at_the_full_interval(db, owner, site):
     """The lease must not become the real cadence for healthy monitors."""
-    monitor = make_monitor(db, owner, f"{fault_site}/", interval_seconds=3600)
+    monitor = make_monitor(db, owner, f"{site.url}/", interval_seconds=3600)
     run_check(db, monitor)
     db.commit()
     wait = (monitor.next_check_at - datetime.now(timezone.utc)).total_seconds()
@@ -213,16 +145,16 @@ def test_completed_check_reschedules_at_the_full_interval(db, owner, fault_site)
 # HIGH - transient blank pages must not look like changes
 # ---------------------------------------------------------------------------
 
-def test_transient_blank_page_produces_no_false_notification(db, owner, fault_site):
+def test_transient_blank_page_produces_no_false_notification(db, owner, site):
     """Measured before the fix: two blips of an unchanged page produced four
     webhook notifications, none of them real."""
-    monitor = make_monitor(db, owner, f"{fault_site}/")
+    monitor = make_monitor(db, owner, f"{site.url}/")
     run_check(db, monitor)          # baseline
     db.commit()
     baseline = monitor.last_content
 
     for path in ("/empty", "/", "/empty", "/"):
-        monitor.url = f"{fault_site}{path}"
+        monitor.url = f"{site.url}{path}"
         db.commit()
         run_check(db, monitor)
         db.commit()
@@ -232,13 +164,13 @@ def test_transient_blank_page_produces_no_false_notification(db, owner, fault_si
     assert monitor.last_content == baseline, "the baseline must survive a blank blip"
 
 
-def test_a_genuinely_emptied_page_is_still_reported(db, owner, fault_site):
+def test_a_genuinely_emptied_page_is_still_reported(db, owner, site):
     """The blank guard must delay a real change, never suppress it."""
-    monitor = make_monitor(db, owner, f"{fault_site}/")
+    monitor = make_monitor(db, owner, f"{site.url}/")
     run_check(db, monitor)
     db.commit()
 
-    monitor.url = f"{fault_site}/empty"
+    monitor.url = f"{site.url}/empty"
     db.commit()
     statuses = []
     for _ in range(settings.empty_content_confirmations + 1):

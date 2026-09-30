@@ -6,9 +6,7 @@ so a future refactor cannot quietly reopen one.
 
 from __future__ import annotations
 
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -21,96 +19,31 @@ from app.core.fetcher import FetchError, fetch
 # audit_1 / C1 - SSRF via redirect
 # ---------------------------------------------------------------------------
 
-INTERNAL_SECRET = "INTERNAL-ONLY-CONTENT"
-
-
-class _Internal(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        body = f"<html><body>{INTERNAL_SECRET}</body></html>".encode()
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-@pytest.fixture
-def internal_server():
-    srv = HTTPServer(("127.0.0.1", 0), _Internal)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        yield srv.server_address[1]
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
-
-@pytest.fixture
-def redirector(internal_server):
-    target = f"http://127.0.0.1:{internal_server}/secret"
-
-    class _Redirect(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
-
-        def do_GET(self):
-            self.send_response(302)
-            self.send_header("Location", target)
-            self.end_headers()
-
-    srv = HTTPServer(("127.0.0.1", 0), _Redirect)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        yield srv.server_address[1]
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
-
-def test_redirect_to_private_address_is_blocked(redirector, monkeypatch):
+def test_redirect_to_private_address_is_blocked(raw_site, monkeypatch):
     """A public host answering 302 -> 127.0.0.1 must not defeat the SSRF guard.
 
-    Only the attacker's own (notionally public) host is allowed through
-    validation; every later hop is validated for real.
+    Only the attacker's own (notionally public) host passes validation; every
+    later hop is validated for real.
     """
+    raw_site.redirect_target = f"{raw_site.url}/secret"
     real_validate = fetcher_module.validate_target_url
 
     def first_hop_public(url: str) -> str:
-        if f":{redirector}" in url:
-            return url
-        return real_validate(url)
+        return url if url.endswith("/redirect") else real_validate(url)
 
     monkeypatch.setattr(fetcher_module, "validate_target_url", first_hop_public)
+    monkeypatch.setattr(settings, "min_seconds_between_hits_per_host", 0)
 
     with pytest.raises(FetchError) as exc:
-        fetch(f"http://127.0.0.1:{redirector}/start", respect_robots=False, throttle=False)
+        fetch(f"{raw_site.url}/redirect", respect_robots=False, throttle=False)
     assert exc.value.kind == "blocked_target"
 
 
-def test_redirect_chain_is_bounded(monkeypatch):
+def test_redirect_chain_is_bounded(site):
     """An endless redirect loop must terminate, not spin forever."""
-
-    class _Loop(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
-
-        def do_GET(self):
-            self.send_response(302)
-            self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/next")
-            self.end_headers()
-
-    srv = HTTPServer(("127.0.0.1", 0), _Loop)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setattr(settings, "allow_private_network_targets", True)
-    try:
-        with pytest.raises(FetchError) as exc:
-            fetch(f"http://127.0.0.1:{srv.server_address[1]}/", respect_robots=False, throttle=False)
-        assert exc.value.kind == "too_many_redirects"
-    finally:
-        srv.shutdown()
-        srv.server_close()
+    with pytest.raises(FetchError) as exc:
+        fetch(f"{site.url}/redirect", respect_robots=False, throttle=False)
+    assert exc.value.kind == "too_many_redirects"
 
 
 # ---------------------------------------------------------------------------

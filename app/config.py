@@ -50,11 +50,9 @@ class Settings(BaseSettings):
 
     # --- Scheduler / worker -------------------------------------------------
     scheduler_enabled: bool = True
-    # Sustained check capacity is check_batch_size / scheduler_tick_seconds, and
-    # nothing else. The original defaults (50/20s = 2.5 checks/s) were below what
-    # a single Business customer needs at the advertised limits (300 monitors on
-    # a 60s interval = 5 checks/s), so the plans on the pricing page could not be
-    # delivered by the shipped configuration. See capacity_report().
+    # Sustained capacity is check_batch_size / scheduler_tick_seconds and
+    # nothing else, and it must exceed what the largest plan promises - see
+    # capacity_report(), which warns at startup when it does not.
     scheduler_tick_seconds: int = 10
     worker_concurrency: int = 16
     check_batch_size: int = 200

@@ -64,11 +64,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> ApiKeyCreat
     """Create an account and return its first API key. Self-serve, no human in the loop."""
     email = payload.email.lower().strip()
     if db.scalar(select(User).where(User.email == email)):
-        # Deliberately vague. NOTE: this only narrows the enumeration oracle,
-        # it does not close it - the status code still differs from a successful
-        # signup. Closing it fully requires an email-verification flow that
-        # returns an identical 202 in both cases, which needs SMTP configured.
-        # Tracked in docs/SECURITY.md.
+        # Deliberately vague. This only narrows the enumeration oracle - the
+        # status code still differs. See docs/SECURITY.md R2.
         raise AppError("Unable to create an account with those details.")
 
     user = User(email=email, password_hash=hash_password(payload.password), plan=DEFAULT_PLAN)

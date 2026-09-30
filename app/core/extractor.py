@@ -21,19 +21,11 @@ from app.models import ExtractMode
 MAX_EXTRACT_CHARS = 200_000
 _NON_CONTENT_TAGS = ("script", "style", "noscript", "template", "svg")
 
-# --- ReDoS containment -----------------------------------------------------
-# Extraction patterns are supplied by users and run on our servers, so a
-# catastrophic-backtracking pattern is a remote CPU denial of service: under
-# stdlib `re`, the pattern "(a+)+$" against 40 characters never returns and
-# pins a worker thread forever.
-#
-# Three layers, because no single one is sufficient:
-#   1. `regex` instead of `re` - it has backtracking protections that defuse
-#      the classic pathological patterns outright.
-#   2. `timeout=` on every user-supplied pattern - a hard wall-clock ceiling
-#      for anything layer 1 does not optimise away.
-#   3. Hard caps on pattern length and input size, so the worst case stays
-#      bounded even if the first two are somehow evaded.
+# ReDoS containment. Users supply these patterns and we run them, so a
+# catastrophic-backtracking pattern is a remote CPU denial of service. Three
+# layers, since none alone suffices: the `regex` engine (defuses the classic
+# pathological cases), a hard `timeout=` on every user pattern, and caps on
+# pattern and input size.
 REGEX_TIMEOUT_SECONDS = 2.0
 MAX_REGEX_INPUT_CHARS = 100_000
 MAX_PATTERN_CHARS = 1_000

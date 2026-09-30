@@ -299,9 +299,8 @@ async def stripe_webhook(
     event_type = event["type"]
     stripe.api_key = settings.stripe_secret_key
 
-    # The event is marked processed ONLY after the work succeeds. Recording it
-    # first (the obvious ordering) loses money: if the Stripe API call below
-    # fails, the customer has paid, the plan was never granted, and Stripe's
+    # Marked processed ONLY after the work succeeds. Recording it first loses
+    # money: a failed Stripe call leaves the customer paid but on Free, and the
     # redelivery is then discarded as a duplicate.
     try:
         _process_event(db, event_type, obj, event.get("created"))
@@ -322,10 +321,9 @@ async def stripe_webhook(
             "Event processing failed; please redeliver."
         ) from exc
 
-    # This commit must be protected too. Left outside the try/except it became
-    # the one unguarded write on the path: under concurrent redelivery it raised
-    # a database lock error straight into the generic 500 handler (measured: 6
-    # of 8 concurrent webhooks returned 500).
+    # Protected too: left outside the try/except this was the one unguarded
+    # write on the path, and concurrent redelivery turned a database lock error
+    # into a 500 - which Stripe retries, making it a redelivery storm.
     try:
         db.add(StripeEvent(id=event_id, type=event_type))
         db.commit()
